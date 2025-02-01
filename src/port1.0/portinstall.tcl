@@ -48,7 +48,7 @@ namespace eval portinstall {
 options install.asroot
 
 # Set defaults
-set install.asroot no
+default install.asroot no
 
 set_ui_prefix
 
@@ -74,7 +74,8 @@ proc portinstall::create_archive {location archive.type} {
     global workpath destpath portpath subport version revision portvariants \
            epoch configure.cxx_stdlib cxx_stdlib PortInfo \
            archive.env archive.cmd archive.pre_args archive.args \
-           archive.post_args archive.dir depends_lib depends_run
+           archive.post_args archive.dir depends_lib depends_run \
+           portarchive_hfscompression
     set archive.env {}
     set archive.cmd {}
     set archive.pre_args {}
@@ -119,7 +120,7 @@ proc portinstall::create_archive {location archive.type} {
                 return -code error "No '$pax' was found on this system!"
             }
         }
-        t(ar|bz|lz|xz|gz) {
+        t(ar|bz|lz|xz|gz|mptar) {
             set tar "tar"
             if {[catch {set tar [findBinary $tar ${portutil::autoconf::tar_path}]} errmsg] == 0} {
                 ui_debug "Using $tar"
@@ -159,7 +160,25 @@ proc portinstall::create_archive {location archive.type} {
                         return -code error "No '$gzip' was found on this system!"
                     }
                 } else {
-                    set archive.args "[shellescape ${location}] ."
+                    if {${archive.type} eq "tmptar"} {
+                        # Pass through tar for hardlink detection and HFS compression,
+                        # but extract without saving the tar file.
+                        if {${portarchive_hfscompression} && [getuid] == 0 &&
+                            ![catch {binaryInPath bsdtar}] &&
+                            ![catch {exec bsdtar -x --hfsCompression < /dev/null >& /dev/null}]
+                        } then {
+                            set extract_tar bsdtar
+                            set extract_tar_args {-xvp --hfsCompression -f}
+                        } else {
+                            set extract_tar $tar
+                            set extract_tar_args {-xvpf}
+                        }
+                        set archive.args {- .}
+                        set archive.post_args "| $extract_tar -C $location $extract_tar_args -"
+                        file mkdir $location
+                    } else {
+                        set archive.args "[shellescape ${location}] ."
+                    }
                 }
             } else {
                 ui_debug $errmsg
@@ -322,7 +341,7 @@ proc portinstall::create_archive {location archive.type} {
     # Now create the archive
     ui_debug "Creating [file tail $location]"
     command_exec archive
-    ui_debug "Archive [file tail $location] packaged"
+    ui_debug "Port image [file tail $location] created"
 
     # Cleanup all control files when finished
     set control_files [glob -nocomplain -types f [file join $destpath +*]]
@@ -332,14 +351,10 @@ proc portinstall::create_archive {location archive.type} {
     }
 }
 
-proc portinstall::extract_contents {location type} {
-    return [extract_archive_metadata $location $type contents]
-}
-
 proc portinstall::install_main {args} {
     global subport version portpath depends_run revision user_options \
     portvariants requested_variants depends_lib PortInfo epoch \
-    portarchivetype
+    portarchivetype portimage_mode
     variable file_is_binary
     variable actual_cxx_stdlib
     variable cxx_stdlib_overridden
@@ -361,15 +376,22 @@ proc portinstall::install_main {args} {
         delete [file join [option workpath] .macports.${subport}.state]
         set location [file join $install_dir [file tail $archive_path]]
         set current_archive_type [string range [file extension $location] 1 end]
-        set contents [extract_contents $location $current_archive_type]
-        lassign $contents installPlist file_is_binary
-        set cxxinfo [extract_archive_metadata $location $current_archive_type cxx_info]
-        lassign $cxxinfo actual_cxx_stdlib cxx_stdlib_overridden
+        set archive_metadata [extract_archive_metadata $location $current_archive_type {contents cxx_info}]
+        lassign [dict get $archive_metadata contents] installPlist file_is_binary
+        lassign [dict get $archive_metadata cxx_info] actual_cxx_stdlib cxx_stdlib_overridden
     } else {
-        # throws an error if an unsupported value has been configured
-        archiveTypeIsSupported $portarchivetype
+        if {$portimage_mode eq "directory"} {
+            # Special value to avoid writing archive out to disk, since
+            # only the extracted dir should be kept.
+            set archivetype tmptar
+            set location [file rootname $location]
+        } else {
+            # throws an error if an unsupported value has been configured
+            archiveTypeIsSupported $portarchivetype
+            set archivetype $portarchivetype
+        }
         # create archive from the destroot
-        create_archive $location $portarchivetype
+        create_archive $location $archivetype
     }
 
     # can't do this inside the write transaction due to deadlock issues with _get_dep_port

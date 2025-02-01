@@ -114,7 +114,7 @@ proc activate {name {version ""} {revision ""} {variants 0} {options ""}} {
             #registry::entry close $requested
             return -code error "Image error: ${name} @${specifier} not installed as an image."
         }
-        if {![::file isfile $location]} {
+        if {![::file exists $location]} {
             #registry::entry close $requested
             return -code error "Image error: Can't find image file $location"
         }
@@ -316,54 +316,124 @@ proc _check_registry {name version revision variants {return_all 0}} {
     throw registry::invalid "Registry error: ${name}${composite_spec} is not installed."
 }
 
-## Activates a file from an image into the filesystem. Deals with symlinks,
-## directories and files.
+# Mapping of directory paths to device numbers. Used to check if files
+# can be hardlinked or cloned, or must be copied.
+variable dir_devices [dict create]
+
+## Activates a list of files from an image into the filesystem. Deals
+## with symlinks and regular files.
 ##
-## @param [in] srcfile path to file in image
-## @param [in] dstfile path to activate file to
-## @return 1 if file needs to be explicitly deleted if we have to roll back, 0 otherwise
-proc _activate_file {srcfile dstfile} {
-    if {[catch {set filetype [::file type $srcfile]} result]} {
+## @param [in] files list of target file paths
+## @param [in] imageroot path to root of image directory
+## @param [in] imageroot path to root of image directory
+## @param [in] rollback_var list name to append activated files to
+## @return list of files that need to be explicitly deleted if we have to roll back
+proc _activate_files {srcfiles dstfiles imageroot rollback_var} {
+    variable progress_step; variable progress_total_steps
+    variable dir_devices; variable keep_imagedir
+    upvar $rollback_var rollback_list
+    set use_clone [expr {$keep_imagedir && [fs_clone_capable $imageroot]}]
+    ::file stat $imageroot statinfo
+    set imagedev $statinfo(dev)
+    set all_attrs [expr {[getuid] == 0}]
+    set hardlinks [dict create]
+
+    foreach srcfile $srcfiles dstfile $dstfiles {
         # this can happen if the archive was built on case-sensitive and we're case-insensitive
         # we know any existing dstfile is ours because we checked for conflicts earlier
-        if {![catch {file type $dstfile}]} {
+        if {![catch {::file type $dstfile}]} {
             ui_debug "skipping case-conflicting file: $srcfile"
-            return 0
-        } else {
-            error $result
+            continue
         }
-    }
-    switch $filetype {
-        directory {
-            # Don't recursively copy directories
-            ui_debug "activating directory: $dstfile"
-            # Don't do anything if the directory already exists.
-            if { ![::file isdirectory $dstfile] } {
-                ::file mkdir $dstfile
-                # fix attributes on the directory.
-                if {[getuid] == 0} {
-                    ::file attributes $dstfile {*}[::file attributes $srcfile]
-                } else {
-                    # not root, so can't set owner/group
+        ui_debug "activating file: $dstfile"
+        set hardlinked 0
+        ::file lstat $srcfile statinfo
+        if {$statinfo(nlink) > 1} {
+            # Hard linked file
+            if {[dict exists $hardlinks $statinfo(ino)]} {
+                # Link to the primary link
+                if {![catch {::file link -hard $dstfile [dict get $hardlinks $statinfo(ino)]}]} {
+                    set hardlinked 1
+                }
+                # Fall back to normal method if hardlinking failed. The destinations
+                # for the links could be on different devices, or a destination
+                # filesystem might not even support hard links.
+            } else {
+                # Set this as the primary link and activate as normal.
+                dict set hardlinks $statinfo(ino) $dstfile
+            }
+        }
+        if {!$hardlinked} {
+            if {$use_clone && [dict get $dir_devices [::file dirname $dstfile]] == $imagedev} {
+                clonefile $srcfile $dstfile
+                # not all permissions are preserved by clonefile
+                if {$statinfo(type) ne "link"} {
                     ::file attributes $dstfile -permissions {*}[::file attributes $srcfile -permissions]
                 }
-                # set mtime on installed element
-                ::file mtime $dstfile [::file mtime $srcfile]
+            } elseif {$keep_imagedir} {
+                ::file copy $srcfile $dstfile
+                if {$statinfo(type) ne "link"} {
+                    if {$all_attrs} {
+                        ::file attributes $dstfile {*}[::file attributes ${srcfile}]
+                    } else {
+                        # not root, so can't set owner/group
+                        ::file attributes $dstfile -permissions {*}[::file attributes ${srcfile} -permissions]
+                    }
+                    ::file mtime $dstfile [::file mtime $srcfile]
+                }
+            } else {
+                ::file rename $srcfile $dstfile
             }
-            return 0
         }
-        default {
-            ui_debug "activating file: $dstfile"
-            ::file rename $srcfile $dstfile
-            return 1
-        }
+        lappend rollback_list $dstfile
+
+        _progress update $progress_step $progress_total_steps
+        incr progress_step
     }
 }
 
-# extract an archive to a temporary location
+## Activates a directory from an image into the filesystem.
+##
+## @param [in] dirs list of destination directory paths
+## @param [in] imageroot path to root of image directory
+proc _activate_directories {dirs imageroot} {
+    variable progress_step; variable progress_total_steps
+    variable dir_devices
+    set all_attrs [expr {[getuid] == 0}]
+    foreach dir $dirs {
+        ui_debug "activating directory: $dir"
+        # Don't do anything if the directory already exists.
+        if {![::file isdirectory $dir]} {
+            ::file mkdir $dir
+            set srcdir ${imageroot}${dir}
+            # fix attributes on the directory.
+            if {$all_attrs} {
+                ::file attributes $dir {*}[::file attributes ${srcdir}]
+            } else {
+                # not root, so can't set owner/group
+                ::file attributes $dir -permissions {*}[::file attributes ${srcdir} -permissions]
+            }
+            # set mtime on installed element
+            ::file mtime $dir [::file mtime ${srcdir}]
+        }
+        if {![dict exists $dir_devices $dir]} {
+            ::file stat $dir statinfo
+            dict set dir_devices $dir $statinfo(dev)
+        }
+        _progress update $progress_step $progress_total_steps
+        incr progress_step
+    }
+}
+
+# extract an archive to a directory
 # returns: path to the extracted directory
-proc extract_archive_to_tmpdir {location} {
-    set extractdir [mkdtemp [::file dirname $location]/mpextractXXXXXXXX]
+proc extract_archive_to_imagedir {location} {
+    set extractdir [file rootname $location]
+    if {[file exists $extractdir]} {
+        set extractdir [mkdtemp ${extractdir}XXXXXXXX]
+    } else {
+        file mkdir $extractdir
+    }
     set startpwd [pwd]
 
     try {
@@ -564,23 +634,95 @@ proc _progress {args} {
     ui_progress_generic {*}${args}
 }
 
+proc _get_port_conflicts {port} {
+    global registry::tdbc_connection
+    if {![info exists tdbc_connection]} {
+        registry::tdbc_connect
+    }
+    variable conflicts_stmt
+    if {![info exists conflicts_stmt]} {
+        set query {SELECT files.id, files.path, files.actual_path FROM
+                (SELECT path FROM files where id = :thisport_id)
+                AS thisport_files
+                INNER JOIN files ON thisport_files.path = files.actual_path
+                WHERE files.active = 1}
+        set conflicts_stmt [$tdbc_connection prepare $query]
+    }
+
+    set thisport_id [$port id]
+    $tdbc_connection transaction {
+        set results [$conflicts_stmt execute]
+    }
+    set id_to_port [dict create]
+    set path_to_port [dict create]
+    set port_to_paths [dict create]
+    set is_replaced [dict create]
+    set todeactivate [dict create]
+    set thisport_name [$port name]
+    foreach result [$results allrows] {
+        set id [dict get $result id]
+        if {![dict exists $id_to_port $id]} {
+            dict set id_to_port $id [lindex [registry::entry search id $id] 0]
+        }
+        set conflicting_port [dict get $id_to_port $id]
+        if {![dict exists $is_replaced $conflicting_port]} {
+            lassign [mportlookup [$conflicting_port name]] _ portinfo
+            if {[dict exists $portinfo replaced_by] && [lsearch -exact -nocase [dict get $portinfo replaced_by] $thisport_name] != -1} {
+                dict set is_replaced $conflicting_port 1
+                dict set todeactivate $conflicting_port 1
+            } else {
+                dict set is_replaced $conflicting_port 0
+            }
+        }
+        set actual_path [dict get $result actual_path]
+        dict set path_to_port $actual_path $conflicting_port
+        if {![dict get $is_replaced $conflicting_port]} {
+            set imagepath [dict get $result path]
+            dict lappend port_to_paths $conflicting_port [list $imagepath $actual_path]
+        }
+    }
+    $results close
+    return [list $path_to_port $port_to_paths $todeactivate]
+}
+
 ## Activates the contents of a port
 proc _activate_contents {port {rename_list {}}} {
     variable force
     variable noexec
+    variable keep_archive
+    variable keep_imagedir
     variable progress_step
     variable progress_total_steps
 
     set files [list]
     set baksuffix .mp_[clock seconds]
+    set portname [$port name]
     set location [$port location]
     set imagefiles [$port imagefiles]
     set num_imagefiles [llength $imagefiles]
-    set progress_total_steps [expr {$num_imagefiles * 3}]
-    set extracted_dir [extract_archive_to_tmpdir $location]
-    set replaced_by_re "(?i)^[$port name]\$"
+
+    set progress_step 0
+    if {[::file isfile $location]} {
+        set progress_total_steps [expr {$num_imagefiles * 3}]
+        set extracted_dir [extract_archive_to_imagedir $location]
+        # extract phase complete, assume 1/3 is done
+        set progress_step $num_imagefiles
+        if {!$keep_archive} {
+            registry::write {
+                $port location $extracted_dir
+            }
+            file delete $location
+            set location $extracted_dir
+        }
+    } else {
+        set extracted_dir $location
+        set progress_total_steps [expr {$num_imagefiles * 2}]
+        _progress start
+    }
 
     set backups [list]
+    set seendirs [dict create]
+    set confirmed_rename_list [list]
     # This is big and hairy and probably could be done better.
     # First, we need to check the source file, make sure it exists
     # Then we remove the $location from the path of the file in the contents
@@ -588,68 +730,90 @@ proc _activate_contents {port {rename_list {}}} {
     # Last, if the file exists, and belongs to another port, and force is set
     #  we remove the file from the file_map, take ownership of it, and
     #  clobber it
-    set todeactivate [list]
+    set todeactivate [dict create]
     try {
         registry::write {
-            # extract phase complete, assume 1/3 is done
-            set progress_step $num_imagefiles
             foreach file $imagefiles {
                 incr progress_step
                 _progress update $progress_step $progress_total_steps
                 set srcfile "${extracted_dir}${file}"
 
-                # To be able to install links, we test if we can lstat the file to
+                # To be able to install links, we test if 'file type' errors to
                 # figure out if the source file exists (file exists will return
                 # false for symlinks on files that do not exist)
-                if { [catch {::file lstat $srcfile dummystatvar}] } {
-                    throw registry::image-error "Image error: Source file $srcfile does not appear to exist (cannot lstat it).  Unable to activate port [$port name]."
+                if {[catch {::file type $srcfile}]} {
+                    throw registry::image-error "Image error: Source file $srcfile does not appear to exist.  Unable to activate port ${portname}."
                 }
 
-                set owner [registry::entry owner $file]
-
-                if {$owner ne {} && $owner ne $port} {
-                    # deactivate conflicting port if it is replaced_by this one
-                    set result [mportlookup [$owner name]]
-                    set portinfo [lindex $result 1]
-                    if {[dict exists $portinfo replaced_by] && [lsearch -regexp [dict get $portinfo replaced_by] $replaced_by_re] != -1} {
-                        # we'll deactivate the owner later, but before activating our files
-                        lappend todeactivate $owner
-                        set owner "replaced"
+                if {![catch {::file type $file}]} {
+                    if {![info exists conflicts_path_to_port]} {
+                        # Check for conflicting ports. 'todeactivate' contains ports replaced by this one,
+                        # which we'll deactivate later, but before activating our files.
+                        lassign [_get_port_conflicts $port] conflicts_path_to_port conflicts_port_to_paths todeactivate
+                        if {!$force && [dict size $conflicts_port_to_paths] > 0} {
+                            set msg "The following ports have active files that conflict with ${portname}'s:\n"
+                            foreach conflicting_port [dict keys $conflicts_port_to_paths] {
+                                append msg "[$conflicting_port name] @[$conflicting_port version]_[$conflicting_port revision][$conflicting_port variants]\n"
+                                set conflicting_paths [dict get $conflicts_port_to_paths $conflicting_port]
+                                set pathcounter 0
+                                set pathtotal [llength $conflicting_paths]
+                                foreach p $conflicting_paths {
+                                    if {$pathcounter >= 3 && $pathtotal > 4} {
+                                        append msg "  (... [expr {$pathtotal - $pathcounter}] more not shown)\n"
+                                        break
+                                    }
+                                    append msg "  [lindex $p 1]\n"
+                                    incr pathcounter
+                                }
+                            }
+                            append msg "Image error: Conflicting file(s) present. Please deactivate the conflicting port(s) first, or use 'port -f activate $portname' to force the activation."
+                            throw registry::image-error $msg
+                        }
                     }
-                }
-
-                if {$owner ne "replaced"} {
-                    if { [string is true -strict $force] } {
-                        # if we're forcing the activation, then we move any existing
-                        # files to a backup file, both in the filesystem and in the
-                        # registry
-                        if { ![catch {::file type $file}] } {
-                            set bakfile "${file}${baksuffix}"
-                            _progress intermission
-                            ui_warn "File $file already exists.  Moving to: $bakfile."
-                            ::file rename -force -- $file $bakfile
-                            lappend backups $file
-                        }
-                        if { $owner ne {} } {
-                            $owner deactivate [list $file]
-                            $owner activate [list $file] [list "${file}${baksuffix}"]
-                        }
+                    if {[dict exists $conflicts_path_to_port $file]} {
+                        set owner [dict get $conflicts_path_to_port $file]
                     } else {
-                        # if we're not forcing the activation, then we bail out if
-                        # we find any files that already exist, or have entries in
-                        # the registry
-                        if { $owner ne {} && $owner ne $port } {
-                            set msg "Image error: $file is being used by the active [$owner name] port.  Please deactivate this port first, or use 'port -f activate [$port name]' to force the activation."
-                            #registry::entry close $owner
-                            throw registry::image-error $msg
-                        } elseif { $owner eq {} && ![catch {::file type $file}] } {
-                            set msg "Image error: $file already exists and does not belong to a registered port.  Unable to activate port [$port name]. Use 'port -f activate [$port name]' to force the activation."
+                        set owner {}
+                    }
+                    if {$owner eq {} || ![dict exists $todeactivate $owner]} {
+                        if {$force} {
+                            # if we're forcing the activation, then we move any existing
+                            # files to a backup file, both in the filesystem and in the
+                            # registry
+                            if {$owner ne {}} {
+                                # Rename all conflicting files for this owner.
+                                set owner_deactivate_paths [list]
+                                set owner_activate_paths [list]
+                                set owner_backup_paths [list]
+                                foreach pathpair [dict get $conflicts_port_to_paths $owner] {
+                                    lassign $pathpair path actual_path
+                                    lappend owner_deactivate_paths $path
+                                    if {![catch {::file type $actual_path}]} {
+                                        lappend owner_activate_paths $path
+                                        set bakfile ${actual_path}${baksuffix}
+                                        lappend owner_backup_paths $bakfile
+                                        ui_warn "File $actual_path already exists.  Moving to: $bakfile."
+                                        ::file rename -force -- $actual_path $bakfile
+                                        lappend backups $actual_path
+                                    }
+                                }
+                                $owner deactivate $owner_deactivate_paths
+                                $owner activate $owner_activate_paths $owner_backup_paths
+                            } else {
+                                # Just rename this file.
+                                set bakfile ${file}${baksuffix}
+                                _progress intermission
+                                ui_warn "File $file already exists.  Moving to: $bakfile."
+                                ::file rename -force -- $file $bakfile
+                                lappend backups $file
+                            }
+                        } else {
+                            # if we're not forcing the activation, then we bail out if
+                            # we find any files that already exist
+                            set msg "Image error: $file already exists and does not belong to a registered port.  Unable to activate port ${portname}. Use 'port -f activate $portname' to force the activation."
                             throw registry::image-error $msg
                         }
                     }
-                    #if {$owner ne {}} {
-                    #    registry::entry close $owner
-                    #}
                 }
 
                 # Split out the filename's subpaths and add them to the
@@ -661,8 +825,8 @@ proc _activate_contents {port {rename_list {}}} {
                 # we'll set the directory attributes properly for all
                 # directories.
                 set directory [::file dirname $file]
-                while {$directory ni $files} {
-                    lappend files $directory
+                while {![dict exists $seendirs $directory]} {
+                    dict set seendirs $directory 1
                     # Any add here will mean an additional step in the second
                     # phase of activation. We could just update this once after
                     # this foreach loop is complete, but that could make the
@@ -673,34 +837,33 @@ proc _activate_contents {port {rename_list {}}} {
                     set directory [::file dirname $directory]
                 }
 
-                # Also add the filename to the imagefile list.
-                lappend files $file
+                # Also add the filename to the normal or renamed list.
+                if {[dict exists $rename_list $file]} {
+                    lappend confirmed_rename_list $file [dict get $rename_list $file]
+                } else {
+                    lappend files $file
+                }
             }
         }
+        set directories [dict keys $seendirs]
+        unset seendirs
 
         # deactivate ports replaced_by this one
-        foreach owner $todeactivate {
+        set deactivate_options [dict create ports_nodepcheck 1]
+        foreach owner [dict keys $todeactivate] {
             _progress intermission
-            if {$noexec || ![registry::run_target $owner deactivate [list ports_nodepcheck 1]]} {
-                deactivate [$owner name] "" "" 0 [list ports_nodepcheck 1]
+            if {$noexec || ![registry::run_target $owner deactivate $deactivate_options]} {
+                deactivate [$owner name] "" "" 0 $deactivate_options
             }
         }
 
         # Sort the list in forward order, removing duplicates.
         # Since the list is sorted in forward order, we're sure that
-        # directories are before their elements.
+        # parent directories are before their elements.
         # We don't have to do this as mentioned above, but it makes the
         # debug output of activate make more sense.
-        set files [lsort -increasing -unique $files]
-        # handle files that are to be renamed
-        set confirmed_rename_list [list]
-        foreach {src dest} $rename_list {
-            set index [lsearch -exact -sorted $files $src]
-            if {$index != -1} {
-                set files [lreplace $files $index $index]
-                lappend confirmed_rename_list $src $dest
-            }
-        }
+        set directories [lsort -increasing -unique $directories]
+
         set rollback_filelist [list]
 
         registry::write {
@@ -708,21 +871,16 @@ proc _activate_contents {port {rename_list {}}} {
 
             try {
                 $port activate $imagefiles
-                foreach file $files {
-                    if {[_activate_file "${extracted_dir}${file}" $file] == 1} {
-                        lappend rollback_filelist $file
-                    }
-
-                    _progress update $progress_step $progress_total_steps
-                    incr progress_step
-                }
+                _activate_directories $directories $extracted_dir
+                _activate_files [lmap f $files {string cat ${extracted_dir}${f}}] \
+                                $files $extracted_dir rollback_filelist
                 foreach {src dest} $confirmed_rename_list {
                     $port deactivate [list $src]
                     $port activate [list $src] [list $dest]
-                    if {[_activate_file ${extracted_dir}${src} $dest] == 1} {
-                        lappend rollback_filelist $dest
-                    }
                 }
+                _activate_files [lmap {src _} $confirmed_rename_list {string cat ${extracted_dir}${src}}] \
+                                [lmap {_ dst} $confirmed_rename_list {set dst}] \
+                                $extracted_dir rollback_filelist
 
                 # Recording that the port has been activated should be done
                 # here so that this information cannot be inconsistent with the
@@ -777,9 +935,9 @@ proc _activate_contents {port {rename_list {}}} {
                 ::file rename -force -- "${file}${baksuffix}" $file
             }
             # reactivate deactivated ports
-            foreach entry $todeactivate {
+            foreach entry [dict keys $todeactivate] {
                 if {[$entry state] eq "imaged" && ($noexec || ![registry::run_target $entry activate ""])} {
-                    activate [$entry name] [$entry version] [$entry revision] [$entry variants] [list ports_activate_no-exec $noexec]
+                    activate [$entry name] [$entry version] [$entry revision] [$entry variants] [dict create ports_activate_no-exec $noexec]
                 }
             }
         } finally {
@@ -790,11 +948,14 @@ proc _activate_contents {port {rename_list {}}} {
 
         throw [dict get $eOptions -errorcode] [dict get $eOptions -errorinfo]
     } finally {
-        #foreach entry $todeactivate {
+        #foreach entry [dict keys $todeactivate] {
         #    registry::entry close $entry
         #}
-        # remove temp image dir
-        ::file delete -force $extracted_dir
+        # Only delete extracted dir if there is an archive to re-extract from
+        if {!$keep_imagedir && [file isfile $location]} {
+            # remove temp image dir
+            ::file delete -force $extracted_dir
+        }
     }
 }
 
@@ -802,30 +963,24 @@ proc _activate_contents {port {rename_list {}}} {
 # TODO: look into what other dirs should go here
 variable precious_dirs [dict create /Library/LaunchDaemons 1 /Library/LaunchAgents 1]
 
-proc _deactivate_file {dstfile} {
-    if {[catch {::file type $dstfile} filetype]} {
-        ui_debug "$dstfile does not exist"
-        return
-    }
-    if { $filetype eq "link" } {
-        ui_debug "deactivating link: $dstfile"
-        file delete -- $dstfile
-    } elseif { $filetype eq "directory" } {
-        # 0 item means empty.
-        if { [llength [readdir $dstfile]] == 0 } {
-            variable precious_dirs
-            if {![dict exists $precious_dirs $dstfile]} {
-                ui_debug "deactivating directory: $dstfile"
-                ::file delete -- $dstfile
-            } else {
-                ui_debug "directory $dstfile does not belong to us"
-            }
-        } else {
-            ui_debug "$dstfile is not empty"
-        }
-    } else {
+# Delete the given lists of files and directories, calling _progress
+# update for each one. Nonempty directories are skipped.
+proc _deactivate_files {files directories progress_count progress_total} {
+    foreach dstfile $files {
         ui_debug "deactivating file: $dstfile"
         ::file delete -- $dstfile
+        incr progress_count
+        _progress update $progress_count $progress_total
+    }
+    foreach dstdir $directories {
+        if {[dirempty $dstdir]} {
+            ui_debug "deactivating directory: $dstdir"
+            ::file delete -- $dstdir
+        } else {
+            ui_debug "$dstdir is not empty"
+        }
+        incr progress_count
+        _progress update $progress_count $progress_total
     }
 }
 
@@ -839,6 +994,8 @@ proc _deactivate_contents {port imagefiles {force 0} {rollback 0}} {
 
     _progress start
 
+    set seendirs [dict create]
+    variable precious_dirs
     foreach file $imagefiles {
         incr progress_step
         _progress update $progress_step $progress_total_steps
@@ -858,8 +1015,13 @@ proc _deactivate_contents {port imagefiles {force 0} {rollback 0}} {
 
             # Split out the filename's subpaths and add them to the image list
             # as well.
-            while {$directory ni $files} {
-                lappend files $directory
+            while {![dict exists $seendirs $directory]} {
+                if {[dict exists $precious_dirs $directory]} {
+                    dict set seendirs $directory 0
+                    ui_debug "directory $directory does not belong to us"
+                    break
+                }
+                dict set seendirs $directory 1
                 incr progress_total_steps
                 set directory [::file dirname $directory]
             }
@@ -867,13 +1029,15 @@ proc _deactivate_contents {port imagefiles {force 0} {rollback 0}} {
             ui_debug "$file does not exist."
         }
     }
+    set directories [dict keys [dict filter $seendirs value 1]]
+    unset seendirs
 
     # Sort the list in reverse order, removing duplicates.
-    # Since the list is sorted in reverse order, we're sure that directories
-    # are after their elements.
-    set files [lsort -decreasing -unique $files]
+    # Since the list is sorted in reverse order, we're sure that
+    # parent directories are after their elements.
+    set directories [lsort -decreasing -unique $directories]
 
-    set progress_total_steps [expr {[llength $imagefiles] + [llength $files]}]
+    set progress_total_steps [expr {[llength $imagefiles] + [llength $files] + [llength $directories]}]
 
     # Avoid interruptions while removing the files and updating the database to
     # prevent inconsistencies from forming between filesystem and database.
@@ -891,25 +1055,15 @@ proc _deactivate_contents {port imagefiles {force 0} {rollback 0}} {
         if {!$rollback} {
             registry::write {
                 $port deactivate $imagefiles
-                foreach file $files {
-                    _deactivate_file $file
 
-                    incr progress_step
-                    _progress update $progress_step $progress_total_steps
-                }
+                _deactivate_files $files $directories $progress_step $progress_total_steps
 
                 # Update the port's state in the same transaction as the file
                 # delete operations.
                 $port state imaged
             }
         } else {
-            foreach file $files {
-                _deactivate_file $file
-
-                incr progress_step
-                _progress update $progress_step $progress_total_steps
-            }
-
+           _deactivate_files $files $directories $progress_step $progress_total_steps
         }
     } finally {
         # restore the signal block state

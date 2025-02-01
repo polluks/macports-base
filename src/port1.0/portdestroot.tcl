@@ -52,18 +52,18 @@ options destroot.target destroot.destdir destroot.clean destroot.keepdirs destro
 commands destroot
 
 # Set defaults
-set destroot.asroot no
+default destroot.asroot no
 default destroot.dir {${build.dir}}
 default destroot.cmd {${build.cmd}}
 default destroot.pre_args {[portdestroot::destroot_getargs]}
-set destroot.target install
+default destroot.target install
 default destroot.post_args {${destroot.destdir}}
 default destroot.destdir {DESTDIR=${destroot}}
 default destroot.nice {${buildnicevalue}}
 default destroot.umask {$system_options(destroot_umask)}
-set destroot.clean no
-set destroot.keepdirs {}
-set destroot.violate_mtree no
+default destroot.clean no
+default destroot.keepdirs {}
+default destroot.violate_mtree no
 default destroot.delete_la_files {${delete_la_files}}
 
 set_ui_prefix
@@ -126,7 +126,19 @@ proc portdestroot::destroot_start {args} {
 }
 
 proc portdestroot::destroot_main {args} {
-    command_exec -callback portprogress::target_progress_callback destroot
+    global system_options
+    if {$system_options(clonebin_path) ne ""} {
+        global env
+        set saved_path $env(PATH)
+        set env(PATH) $system_options(clonebin_path):$env(PATH)
+    }
+    try {
+        command_exec -callback portprogress::target_progress_callback destroot
+    } finally {
+        if {[info exists saved_path]} {
+            set env(PATH) $saved_path
+        }
+    }
     return 0
 }
 
@@ -202,12 +214,14 @@ proc portdestroot::destroot_finish {args} {
     }
 
     # Compress all manpages with gzip (instead)
-    set manpath "${destroot}${prefix}/share/man"
-    set gzip [findBinary gzip ${portutil::autoconf::gzip_path}]
-    set gunzip "$gzip -d"
-    set bunzip2 "[findBinary bzip2 ${portutil::autoconf::bzip2_path}] -d"
+    set manpath ${destroot}${prefix}/share/man
     if {[file isdirectory ${manpath}] && [file type ${manpath}] eq "directory"} {
         ui_info "$UI_PREFIX [format [msgcat::mc "Compressing man pages for %s"] ${subport}]"
+
+        set gzip [findBinary gzip ${portutil::autoconf::gzip_path}]
+        set gunzip "$gzip -d"
+        set bunzip2 "[findBinary bzip2 ${portutil::autoconf::bzip2_path}] -d"
+
         set found 0
         set manlinks [list]
         set mandir_re {^(cat|man)(.)$}
@@ -367,6 +381,27 @@ proc portdestroot::destroot_finish {args} {
         }
     } else {
         ui_warn "[format [msgcat::mc "%s installs files outside the common directory structure."] $subport]"
+    }
+
+    # Work around apparent filesystem bug.
+    # https://trac.macports.org/ticket/67336
+    if {![catch {fs_clone_capable $destroot} result] && $result} {
+        global workpath
+        ui_debug "Applying sparse file lseek bug workaround"
+        try {
+            fs-traverse -depth fullpath [list $destroot] {
+                if {[file type $fullpath] eq "file" && [fileIsSparse $fullpath]} {
+                    ui_debug "Cloning $fullpath for workaround"
+                    clonefile $fullpath ${workpath}/.macports-sparse-workaround
+                    file delete ${workpath}/.macports-sparse-workaround
+                    if {![fileIsSparse $fullpath]} {
+                        ui_debug "$fullpath is no longer sparse"
+                    }
+                }
+            }
+        } on error {eMessage} {
+            ui_debug "Error while applying sparse file workaround: $eMessage"
+        }
     }
 
     # Restore umask

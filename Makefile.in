@@ -37,6 +37,9 @@ install::
 	$(INSTALL) -d -o "${DSTUSR}" -g "${DSTGRP}" -m "${DSTMODE}" "$(DESTDIR)${datadir}/macports/"
 	$(INSTALL)    -o "${DSTUSR}" -g "${DSTGRP}" -m 444 setupenv.bash  "$(DESTDIR)${datadir}/macports/"
 	$(INSTALL)    -o "${DSTUSR}" -g "${DSTGRP}" -m 444 $(srcdir)/macports-pubkey.pem  "$(DESTDIR)${datadir}/macports/"
+	$(INSTALL) -d -o "${DSTUSR}" -g "${DSTGRP}" -m "${DSTMODE}" "$(DESTDIR)${datadir}/macports/keys"
+	$(INSTALL) -d -o "${DSTUSR}" -g "${DSTGRP}" -m "${DSTMODE}" "$(DESTDIR)${datadir}/macports/keys/base"
+	$(INSTALL)    -o "${DSTUSR}" -g "${DSTGRP}" -m 444 $(srcdir)/keys/base/*.pub  "$(DESTDIR)${datadir}/macports/keys/base/"
 # Only run these scripts when not building in a destroot
 ifeq ($(DESTDIR),)
 # create run user if it doesn't exist
@@ -145,6 +148,9 @@ dist:
 		done >> ${DISTNAME}.chk.txt; \
 		if [ -n "${DISTGPGID}" ]; then \
 			gpg --sign --detach-sig --armor --local-user ${DISTGPGID} $$tarball; \
+		fi; \
+		if [ -n "${DISTKEY}" ]; then \
+			../vendor/signify-osx/signify -S -s "${DISTKEY}" -m $$tarball; \
 		fi; \
 	done
 

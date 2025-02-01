@@ -144,7 +144,7 @@ proc portclean::clean_dist {args} {
     if {$dist_subdir ne $name} {
         if {!([info exists ports_force] && $ports_force eq "yes")
             && [file isdirectory $distpath]
-            && [llength [readdir $distpath]] > 0} {
+            && ![dirempty $distpath]} {
             ui_warn [format [msgcat::mc "Distfiles directory '%s' may contain distfiles needed for other ports, use the -f flag to force removal" ] $distpath]
         } else {
             lappend dirlist $dist_subdir
@@ -242,7 +242,7 @@ proc portclean::clean_archive {args} {
             # thus can't be checked and aren't useful anyway.
             set archivetype [string range [file extension $path] 1 end]
             if {[file isfile $path] && ($archivetype eq "TMP"
-                || [extract_archive_metadata $path $archivetype portname] eq $subport)} {
+                || [dict get [extract_archive_metadata $path $archivetype portname] portname] eq $subport)} {
                 ui_debug "Removing archive: $path"
                 if {[catch {delete $path} result]} {
                     ui_debug "$::errorInfo"

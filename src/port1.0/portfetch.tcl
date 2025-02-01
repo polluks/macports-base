@@ -62,63 +62,63 @@ commands cvs
 commands svn
 
 # Defaults
-set extract.suffix .tar.gz
-set fetch.type standard
+default extract.suffix .tar.gz
+default fetch.type standard
 
 default bzr.cmd {[findBinary bzr $portutil::autoconf::bzr_path]}
 default bzr.dir {${workpath}}
-set bzr.revision -1
-set bzr.pre_args {--builtin --no-aliases checkout --lightweight --verbose}
-set bzr.args {}
+default bzr.revision -1
+default bzr.pre_args {--builtin --no-aliases checkout --lightweight --verbose}
+default bzr.args {}
 default bzr.post_args {-r ${bzr.revision} ${bzr.url} ${worksrcdir}}
 
 default cvs.cmd {[findBinary cvs $portutil::autoconf::cvs_path]}
-set cvs.password {}
+default cvs.password {}
 default cvs.dir {${workpath}}
-set cvs.method export
+default cvs.method export
 default cvs.module {$distname}
-set cvs.tag {}
-set cvs.date {}
+default cvs.tag {}
+default cvs.date {}
 default cvs.env {CVS_PASSFILE=${workpath}/.cvspass}
 default cvs.pre_args {-z9 -f -d ${cvs.root}}
-set cvs.args {}
+default cvs.args {}
 default cvs.post_args {${cvs.module}}
 
 default svn.cmd {${prefix_frozen}/bin/svn}
 default svn.dir {${workpath}}
-set svn.method export
-set svn.revision {}
-set svn.env {}
-set svn.pre_args --non-interactive
-set svn.args {}
-set svn.post_args {}
+default svn.method export
+default svn.revision {}
+default svn.env {}
+default svn.pre_args --non-interactive
+default svn.args {}
+default svn.post_args {}
 
 default git.cmd {[portfetch::find_git_path]}
 default git.dir {${workpath}}
-set git.branch {}
+default git.branch {}
 
 default hg.cmd {[findBinary hg $portutil::autoconf::hg_path]}
 default hg.dir {${workpath}}
-set hg.tag tip
+default hg.tag tip
 
 # Set distfiles
 default distfiles {[list [portfetch::suffix [join $distname]]]}
 default dist_subdir {${name}}
 
 # user name & password
-set fetch.user {}
-set fetch.password {}
+default fetch.user {}
+default fetch.password {}
 # Use EPSV for FTP transfers
-set fetch.use_epsv yes
+default fetch.use_epsv yes
 # Ignore SSL certificate
-set fetch.ignore_sslcert no
+default fetch.ignore_sslcert no
 # Use remote timestamps
-set fetch.remote_time no
-set fetch.user_agent {}
+default fetch.remote_time no
+default fetch.user_agent {}
 
-set global_mirror_site macports_distfiles
-set mirror_sites.listfile mirror_sites.tcl
-set mirror_sites.listpath port1.0/fetch
+default global_mirror_site macports_distfiles
+default mirror_sites.listfile mirror_sites.tcl
+default mirror_sites.listpath port1.0/fetch
 
 # Option-executed procedures
 option_proc use_tar   portfetch::set_extract_type
@@ -186,14 +186,14 @@ proc portfetch::set_fetch_type {option action args} {
                 depends_fetch-append bin:cvs:cvs
             }
             svn {
-                depends_fetch-append port:subversion
+                depends_fetch-append path:bin/svn:subversion
             }
             git {
                 # Oldest macOS version whose git can validate GitHub's SSL certificate.
                 if {${os.major} >= 14 || ${os.platform} ne "darwin"} {
                     depends_fetch-append bin:git:git
                 } else {
-                    depends_fetch-append port:git
+                    depends_fetch-append path:bin/git:git
                 }
             }
             hg {

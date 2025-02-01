@@ -98,30 +98,30 @@ options startupitems startupitem.autostart startupitem.debug \
         startupitem.stop startupitem.type startupitem.uniquename \
         startupitem.user startupitem.daemondo.verbosity
 
-set startupitem.autostart   no
-set startupitem.custom_file {}
-set startupitem.debug       no
-set startupitem.executable  {}
-set startupitem.group       {}
-set startupitem.init        {}
+default startupitem.autostart   no
+default startupitem.custom_file {}
+default startupitem.debug       no
+default startupitem.executable  {}
+default startupitem.group       {}
+default startupitem.init        {}
 default startupitem.install     {$system_options(startupitem_install)}
-set startupitem.location    LaunchDaemons
-set startupitem.logevents   no
-set startupitem.logfile     {}
+default startupitem.location    LaunchDaemons
+default startupitem.logevents   no
+default startupitem.logfile     {}
 default startupitem.logfile.stderr {${startupitem.logfile}}
 default startupitem.name        {${subport}}
-set startupitem.netchange   no
-set startupitem.pidfile     {}
+default startupitem.netchange   no
+default startupitem.pidfile     {}
 default startupitem.plist       {${startupitem.uniquename}.plist}
-set startupitem.requires    {}
-set startupitem.restart     {}
-set startupitem.start       {}
-set startupitem.stop        {}
+default startupitem.requires    {}
+default startupitem.restart     {}
+default startupitem.start       {}
+default startupitem.stop        {}
 default startupitem.type        {[portstartupitem::get_startupitem_type]}
 default startupitem.uniquename  {org.macports.${startupitem.name}}
-set startupitem.user        {}
+default startupitem.user        {}
 
-set startupitem.daemondo.verbosity  1
+default startupitem.daemondo.verbosity  1
 
 set_ui_prefix
 
@@ -520,9 +520,9 @@ proc portstartupitem::startupitem_create {} {
     foreach_startupitem {
         if {${si_type} ne "none" && ([tbool si_create] || $si_custom_file ne "")} {
             if {[tbool si_create]} {
-                ui_notice "$UI_PREFIX [msgcat::mc "Creating ${si_type} control script '$si_name'"]"
+                ui_debug "Creating ${si_type} control script '$si_name'"
             } else {
-                ui_notice "$UI_PREFIX [msgcat::mc "Installing ${si_type} control script '$si_name'"]"
+                ui_debug "Installing ${si_type} control script '$si_name'"
             }
 
             switch -- ${si_type} {

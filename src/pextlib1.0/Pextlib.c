@@ -70,6 +70,14 @@
 #include <unistd.h>
 #include <assert.h>
 
+/* For clonefile */
+#ifdef HAVE_SYS_ATTR_H
+#include <sys/attr.h>
+#endif
+#ifdef HAVE_SYS_CLONEFILE_H
+#include <sys/clonefile.h>
+#endif
+
 #ifdef __MACH__
 #include <mach-o/loader.h>
 #include <mach-o/fat.h>
@@ -1067,6 +1075,129 @@ int FSCaseSensitiveCmd(ClientData clientData UNUSED, Tcl_Interp *interp, int obj
     }
 }
 
+/**
+ * Determines filesystem clone capability for a specific path.
+ * Returns 1 if the FS supports clones, 0 otherwise.
+ * Errors out if the capability could not be determined.
+ */
+int FSCloneCapableCmd(ClientData clientData UNUSED, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
+    Tcl_Obj *tcl_result;
+    int ret = 0;
+
+    if (objc != 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "path");
+        return TCL_ERROR;
+    }
+
+#ifdef VOL_CAP_INT_CLONE
+    char *path = Tcl_GetString(objv[1]);
+    if (!path) {
+        return TCL_ERROR;
+    }
+
+    struct attrlist attrlist;
+    volcaps_t volcaps;
+
+    memset(&attrlist, 0, sizeof(attrlist));
+    attrlist.bitmapcount = ATTR_BIT_MAP_COUNT;
+    attrlist.volattr = ATTR_VOL_CAPABILITIES;
+
+    if (-1 == getattrlist(path, &attrlist, &volcaps, sizeof(volcaps), 0)
+        || (attrlist.volattr & ATTR_VOL_CAPABILITIES) == 0) {
+        return TCL_ERROR;
+    }
+
+    if ((volcaps.volcaps.valid[VOL_CAPABILITIES_INTERFACES] & VOL_CAP_INT_CLONE)) {
+        /* capabilities bit for clone valid */
+        ret = (volcaps.volcaps.capabilities[VOL_CAPABILITIES_INTERFACES] & VOL_CAP_INT_CLONE) != 0;
+    }
+#endif /* VOL_CAP_INT_CLONE */
+
+    tcl_result = Tcl_NewBooleanObj(ret);
+    Tcl_SetObjResult(interp, tcl_result);
+    return TCL_OK;
+}
+
+/**
+ * Interface to clonefile(2)
+ */
+int ClonefileCmd(ClientData clientData UNUSED, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
+    int ret = -1;
+
+    if (objc != 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "srcpath dstpath");
+        return TCL_ERROR;
+    }
+
+#ifdef HAVE_CLONEFILE
+    char *srcpath = Tcl_GetString(objv[1]);
+    char *dstpath = Tcl_GetString(objv[2]);
+    if (!srcpath || !dstpath) {
+        return TCL_ERROR;
+    }
+
+    ret = clonefile(srcpath, dstpath, CLONE_NOFOLLOW);
+    if (ret != 0) {
+        Tcl_SetErrno(errno);
+        Tcl_ResetResult(interp);
+        Tcl_AppendResult(interp, "clonefile failed: ", (char *)Tcl_PosixError(interp), NULL);
+    }
+#endif /* HAVE_CLONEFILE */
+
+    if (ret == 0) {
+        return TCL_OK;
+    }
+    return TCL_ERROR;
+}
+
+static int fileIsSparseCmd(ClientData clientData UNUSED, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
+#ifdef SEEK_HOLE
+    const char *path;
+    struct stat st;
+    int fd;
+    off_t end_offset;
+    off_t hole_offset;
+
+    if (objc != 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "filename");
+        return TCL_ERROR;
+    }
+
+    path = Tcl_GetString(objv[1]);
+    if (-1 == lstat(path, &st)) {
+        /* an error occurred */
+        Tcl_SetErrno(errno);
+        Tcl_ResetResult(interp);
+        Tcl_AppendResult(interp, "lstat(", path, "):", (char *)Tcl_PosixError(interp), NULL);
+        return TCL_ERROR;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        /* not a regular file, haven't seen directories which are sparse yet */
+        Tcl_SetObjResult(interp, Tcl_NewBooleanObj(false));
+        return TCL_OK;
+    }
+    if ((fd = open(path, O_RDONLY)) < 0) {
+        Tcl_SetErrno(errno);
+        Tcl_ResetResult(interp);
+        Tcl_AppendResult(interp, "open(", path, "): ", (char *)Tcl_PosixError(interp), NULL);
+        return TCL_ERROR;
+    }
+
+    lseek(fd, 0, SEEK_SET);
+    hole_offset = lseek(fd, 0, SEEK_HOLE);
+    end_offset = lseek(fd, 0, SEEK_END);
+    close(fd);
+    if (hole_offset >= 0 && end_offset >= 0
+        && hole_offset < end_offset) {
+        Tcl_SetObjResult(interp, Tcl_NewBooleanObj(true));
+        return TCL_OK;
+    }
+#endif /* SEEK_HOLE */
+
+    Tcl_SetObjResult(interp, Tcl_NewBooleanObj(false));
+    return TCL_OK;
+}
+
 int Pextlib_Init(Tcl_Interp *interp)
 {
     if (Tcl_InitStubs(interp, "8.4", 0) == NULL)
@@ -1075,6 +1206,7 @@ int Pextlib_Init(Tcl_Interp *interp)
 	Tcl_CreateObjCommand(interp, "system", SystemCmd, NULL, NULL);
 	Tcl_CreateObjCommand(interp, "adv-flock", AdvFlockCmd, NULL, NULL);
 	Tcl_CreateObjCommand(interp, "readdir", ReaddirCmd, NULL, NULL);
+	Tcl_CreateObjCommand(interp, "dirempty", DiremptyCmd, NULL, NULL);
 	Tcl_CreateObjCommand(interp, "strsed", StrsedCmd, NULL, NULL);
 	Tcl_CreateObjCommand(interp, "mktemp", MktempCmd, NULL, NULL);
 	Tcl_CreateObjCommand(interp, "mkdtemp", MkdtempCmd, NULL, NULL);
@@ -1100,6 +1232,7 @@ int Pextlib_Init(Tcl_Interp *interp)
 #ifdef __MACH__
     Tcl_CreateObjCommand(interp, "fileIsBinary", fileIsBinaryCmd, NULL, NULL);
 #endif
+    Tcl_CreateObjCommand(interp, "fileIsSparse", fileIsSparseCmd, NULL, NULL);
 
     Tcl_CreateObjCommand(interp, "readline", ReadlineCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "rl_history", RLHistoryCmd, NULL, NULL);
@@ -1127,6 +1260,8 @@ int Pextlib_Init(Tcl_Interp *interp)
     Tcl_CreateObjCommand(interp, "set_max_open_files", SetMaxOpenFilesCmd, NULL, NULL);
 
     Tcl_CreateObjCommand(interp, "fs_case_sensitive", FSCaseSensitiveCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "fs_clone_capable", FSCloneCapableCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "clonefile", ClonefileCmd, NULL, NULL);
 
     if (Tcl_PkgProvide(interp, "Pextlib", "1.0") != TCL_OK)
         return TCL_ERROR;

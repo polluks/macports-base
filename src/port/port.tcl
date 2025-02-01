@@ -169,17 +169,28 @@ proc registry_installed {portname {portversion ""} {require_single yes} {only_ac
     }
 
     if {[llength $matches] > 1} {
+        global macports::ui_options
         # set portname again since the one we were passed may not have had the correct case
         set portname [[lindex $matches 0] name]
-        ui_notice "The following versions of $portname are currently installed:"
+        set msg "The following versions of $portname are currently installed:"
+        set portilist [list]
         foreach i $matches {
             if {[$i state] eq "installed"} {
-                puts "  $portname @[$i version]_[$i revision][$i variants] (active)"
+                lappend portilist "  $portname @[$i version]_[$i revision][$i variants] (active)"
             } else {
-                puts "  $portname @[$i version]_[$i revision][$i variants]"
+                lappend portilist "  $portname @[$i version]_[$i revision][$i variants]"
             }
         }
-        return -code error "Registry error: Please specify the full version as recorded in the port registry."
+        if {[info exists ui_options(questions_singlechoice)]} {
+            set retindex [$macports::ui_options(questions_singlechoice) $msg "Choice_Q1" $portilist]
+            return [lindex $matches $retindex]
+        } else {
+            ui_notice $msg
+            foreach portstr $portilist {
+                puts $portstr
+            }
+            return -code error "Registry error: Please specify the full version as recorded in the port registry."
+        }
     } elseif {[llength $matches] == 0} {
         if {$portversion eq ""} {
             return -code error "Registry error: $portname not registered as installed."
@@ -2202,15 +2213,17 @@ proc action_activate { action portlist opts } {
     }
     foreachport $portlist {
         set composite_version [composite_version $portversion $variations]
-        if {![dict exists $options ports_activate_no-exec]
-            && ![catch {registry_installed $portname $composite_version} regref]} {
-
-            if {[$regref installtype] eq "image" && [registry::run_target $regref activate $options]} {
-                continue
-            }
+        if {[catch {registry_installed $portname $composite_version} result]} {
+            break_softcontinue "port activate failed: $result" 1 status
+        }
+        set regref $result
+        if {![dict exists $options ports_activate_no-exec] &&
+            [registry::run_target $regref activate $options]
+        } then {
+            continue
         }
         if {![macports::global_option_isset ports_dryrun]} {
-            if { [catch {portimage::activate_composite $portname $composite_version $options} result] } {
+            if {[catch {portimage::activate_composite $portname $composite_version $options} result]} {
                 ui_debug $::errorInfo
                 break_softcontinue "port activate failed: $result" 1 status
             }
@@ -2418,13 +2431,16 @@ proc action_selfupdate { action portlist opts } {
     if {[prefix_unwritable]} {
         return 1
     }
-    global global_options
+    global global_options ui_options
     set options [array get global_options]
     if {[dict exists $options ports_${action}_nosync] && [dict get $options ports_${action}_nosync] eq "yes"} {
         ui_warn "port selfupdate --nosync is deprecated, use --no-sync instead"
         dict set options ports_${action}_no-sync [dict get $options ports_${action}_nosync]
     }
-    if { [catch {macports::selfupdate $options base_updated} result ] } {
+    if {[info exists ui_options(ports_commandfiles)]} {
+        dict set options ports_${action}_presync 1
+    }
+    if { [catch {macports::selfupdate $options selfupdate_status} result] } {
         ui_debug $::errorInfo
         ui_error $result
         if {![macports::ui_isset ports_verbose]} {
@@ -2437,12 +2453,57 @@ proc action_selfupdate { action portlist opts } {
         fatal "port selfupdate failed: $result"
     }
 
-    if {$base_updated} {
-        # exit immediately if in batch/shell mode
+    if {[dict get $selfupdate_status base_updated]} {
+        # Base was upgraded, re-execute now to trigger sync if possible
+        global argv
+        if {[info exists ui_options(ports_commandfiles)]
+            || {;} in $argv} {
+            # Batch mode or multiple actions on the command line, just exit
+            # since re-executing all actions may not be correct.
+            if {[dict get $selfupdate_status needed_portindex]} {
+                ui_msg "Not all sources could be fully synced using the old version of MacPorts."
+                ui_msg "Please run selfupdate again now that MacPorts base has been updated."
+            }
+            return -999
+        }
+
+        if {![dict exists $options ports_selfupdate_no-sync] || ![dict get $options ports_selfupdate_no-sync]} {
+            # When re-executing, strip the -f flag to prevent an endless loop
+            set new_argv {}
+            foreach arg $argv {
+                if {[string match -nocase {-[a-z]*} $arg]} {
+                    # map the -f flag to nothing
+                    set arg [string map {f ""} $arg]
+                    if {$arg eq "-"} {
+                        # if -f was specified alone, just remove the flag completely
+                        continue
+                    }
+                }
+                lappend new_argv $arg
+            }
+            # If this returns at all, it failed. Just catch any error to avoid
+            # printing a backtrace at the top level.
+            catch {
+                execl $::argv0 $new_argv
+            }
+            ui_error "Failed to re-execute selfupdate, please run 'sudo port selfupdate' manually."
+        }
         return -999
-    } else {
-        return 0
     }
+
+    if {[dict get $selfupdate_status synced]} {
+        ui_msg "\nThe ports tree has been updated."
+        set length_outdated [llength [get_outdated_ports]]
+        if {$length_outdated == 0} {
+            ui_msg "All installed ports are up to date."
+        } else {
+            ui_msg "\n$length_outdated [expr {$length_outdated == 1 ? "port is": "ports are"}] outdated. Run 'port outdated' for details."
+            ui_msg "To upgrade your installed ports, you should run"
+            ui_msg "  port upgrade outdated"
+        }
+    }
+
+    return 0
 }
 
 
@@ -2498,6 +2559,51 @@ proc action_reclaim { action portlist opts } {
     return $status
 }
 
+proc action_snapshot { action portlist opts } {
+    if {![dict exists $opts ports_snapshot_diff] && ![dict exists $opts ports_snapshot_list]
+        && ![dict exists $opts ports_snapshot_help] && [prefix_unwritable]} {
+        return 1
+    }
+    if {[catch {macports::snapshot_main $opts} result]} {
+        ui_debug $::errorInfo
+        return 1
+    }
+	return $result
+}
+
+proc action_restore { action portlist opts } {
+    if {[prefix_unwritable]} {
+        return 1
+    }
+    return [macports::restore_main $opts]
+}
+
+proc action_migrate { action portlist opts } {
+    if {[prefix_unwritable]} {
+        return 1
+    }
+    set result [macports::migrate_main $opts]
+    if {$result == -999} {
+        global ui_options argv
+        if {[info exists ui_options(ports_commandfiles)]
+            || {;} in $argv} {
+            # Batch mode or multiple actions given, just exit since re-
+            # executing all actions may not be correct (and we can't
+            # really edit the args in a batch file anyway).
+            ui_msg "Please run migrate again now that MacPorts base has been updated."
+            return -999
+        }
+        # MacPorts base was upgraded, re-execute migrate with the --continue flag
+        execl $::argv0 [list {*}$::argv "--continue"]
+        ui_debug "Would have executed $::argv0 $::argv --continue"
+        ui_error "Failed to re-execute MacPorts migration, please run 'sudo port migrate' manually."
+    }
+    if {$result == -1} {
+        # snapshot error
+        ui_error "Failed to create a snapshot and migration cannot proceed."
+    }
+    return $result
+}
 
 proc action_upgrade { action portlist opts } {
     if {[require_portlist portlist "yes"] || (![macports::global_option_isset ports_dryrun] && [prefix_unwritable])} {
@@ -3243,9 +3349,16 @@ proc action_space {action portlist opts} {
         }
         set files [$regref files]
         if {$files != 0 && [llength $files] > 0} {
+            set seen_ino [dict create]
             foreach file $files {
                 catch {
-                    set space [expr {$space + [file size $file]}]
+                    file lstat $file statinfo
+                    if {$statinfo(nlink) == 1 || ![dict exists $seen_ino $statinfo(ino)]} {
+                        set space [expr {$space + $statinfo(size)}]
+                    }
+                    if {$statinfo(nlink) != 1} {
+                        dict set seen_ino $statinfo(ino) 1
+                    }
                 }
             }
             if {![dict exists $options ports_space_total] || [dict get $options ports_space_total] ne "yes"} {
@@ -3556,7 +3669,13 @@ proc action_list { action portlist opts } {
             if {[dict exists $portinfo portdir]} {
                 set outdir [dict get $portinfo portdir]
             }
-            puts [format "%-30s @%-14s %s" [dict get $portinfo name] [dict get $portinfo version] $outdir]
+            if {[dict exists $portinfo version]} {
+                set version [dict get $portinfo version]
+            } else {
+                set version {}
+                ui_warn "required option 'version' is missing for $name"
+            }
+            puts [format "%-30s @%-14s %s" $name $version $outdir]
         }
     }
 
@@ -3903,7 +4022,7 @@ proc action_mirror { action portlist opts } {
 
 proc action_exit { action portlist opts } {
     # Return a semaphore telling the main loop to quit
-    return -999
+    return -1
 }
 
 
@@ -4039,6 +4158,10 @@ set action_array [dict create \
     mpkg        [list action_target         [ACTION_ARGS_PORTS]] \
     pkg         [list action_target         [ACTION_ARGS_PORTS]] \
     \
+    snapshot    [list action_snapshot       [ACTION_ARGS_STRINGS]] \
+    restore     [list action_restore        [ACTION_ARGS_STRINGS]] \
+    migrate     [list action_migrate        [ACTION_ARGS_STRINGS]] \
+    \
     quit        [list action_exit           [ACTION_ARGS_NONE]] \
     exit        [list action_exit           [ACTION_ARGS_NONE]] \
 ]
@@ -4115,7 +4238,7 @@ set cmd_opts_array [dict create {*}{
                  depends description epoch exact glob homepage line
                  long_description maintainer maintainers name platform
                  platforms portdir regex revision variant variants version}
-    selfupdate  {no-sync nosync}
+    selfupdate  {migrate no-sync nosync rsync}
     space       {{units 1} total}
     activate    {no-exec}
     deactivate  {no-exec}
@@ -4130,9 +4253,12 @@ set cmd_opts_array [dict create {*}{
     upgrade     {force enforce-variants no-replace no-rev-upgrade}
     rev-upgrade {id-loadcmd-check}
     diagnose    {quiet}
-    reclaim     {enable-reminders disable-reminders}
+    reclaim     {enable-reminders disable-reminders keep-build-deps}
     fetch       {no-mirrors}
     bump        {patch}
+    snapshot    {create list {diff 1} all {delete 1} help {note 1} {export 1} {import 1}}
+    restore     {{snapshot-id 1} all last}
+    migrate     {continue all}
 }]
 
 ##
@@ -4474,7 +4600,7 @@ proc process_cmd { argv } {
         portclient::notifications::display
 
         # semaphore to exit
-        if {$action_status == -999} break
+        if {$action_status < 0} break
     }
 
     return $action_status
@@ -4569,7 +4695,7 @@ proc get_next_cmdline { in out use_readline prompt linename history_file } {
         if { $use_readline && $line ne "" } {
             # Create macports user directory if it does not exist yet
             if {![file isdirectory $macports_user_dir]} {
-                file mkdir macports_user_dir
+                file mkdir $macports_user_dir
 
                 # Also write the history file if this is the case (this sets
                 # the cookie at the top of the file and perhaps other things)
@@ -4630,8 +4756,7 @@ proc process_command_file { in } {
         set exit_status [process_cmd $line]
 
         # Check for semaphore to exit
-        if {$exit_status == -999} {
-            set exit_status 0
+        if {$exit_status < 0} {
             break
         }
     }
@@ -4665,8 +4790,8 @@ proc process_command_files { filelist } {
             close $in
         }
 
-        # Exit on first failure unless -p was given
-        if {$exit_status != 0 && ![macports::ui_isset ports_processall]} {
+        # Exit on first failure unless -p was given. -999 overrides and always exits immediately.
+        if {($exit_status != 0 && ![macports::ui_isset ports_processall]) || $exit_status == -999} {
             return $exit_status
         }
     }
@@ -4801,10 +4926,10 @@ namespace eval portclient::progress {
             intermission -
             finish {
                 # erase to start of line
-                ::term::ansi::send::esol
+                ::term::ansi::send::esolch stderr
                 # return cursor to start of line
-                puts -nonewline "\r"
-                flush stdout
+                puts -nonewline stderr "\r"
+                flush stderr
             }
         }
 
@@ -4856,10 +4981,10 @@ namespace eval portclient::progress {
             }
             finish {
                 # erase to start of line
-                ::term::ansi::send::esol
+                ::term::ansi::send::esolch stderr
                 # return cursor to start of line
-                puts -nonewline "\r"
-                flush stdout
+                puts -nonewline stderr "\r"
+                flush stderr
             }
         }
 
@@ -4959,8 +5084,8 @@ namespace eval portclient::progress {
         # Format the percentage using the space that has been reserved for it
         set percentagesuffix [format " %[expr {$percentageWidth - 3}].1f %%" $percentage]
 
-        puts -nonewline "\r${prefix}\[${progressbar}\]${percentagesuffix}${suffix}"
-        flush stdout
+        puts -nonewline stderr "\r${prefix}\[${progressbar}\]${percentagesuffix}${suffix}"
+        flush stderr
     }
 
 
@@ -5001,8 +5126,8 @@ namespace eval portclient::progress {
             }
         }
 
-        puts -nonewline "\r${prefix}\[${progressbar}\]${suffix}"
-        flush stdout
+        puts -nonewline stderr "\r${prefix}\[${progressbar}\]${suffix}"
+        flush stderr
     }
 }
 
@@ -5011,6 +5136,11 @@ namespace eval portclient::notifications {
     # Ports whose notifications to display; these were either installed
     # or requested to be installed.
     variable notificationsToPrint [dict create]
+
+    ##
+    # Notifications issues by the MacPorts ports system
+    variable systemNotifications
+    set systemNotifications {}
 
     ##
     # Add a port to the list for printing notifications.
@@ -5026,10 +5156,22 @@ namespace eval portclient::notifications {
     }
 
     ##
+    # Add a system notification to print later.
+    #
+    # @param note
+    #        A note to store and display later.
+    proc system_append {note} {
+        variable systemNotifications
+
+        lappend systemNotifications $note
+    }
+
+    ##
     # Print port notifications.
     #
     proc display {} {
         variable notificationsToPrint
+        variable systemNotifications
 
         # Display notes at the end of the activation phase.
         if {[dict size $notificationsToPrint] > 0} {
@@ -5043,6 +5185,20 @@ namespace eval portclient::notifications {
 
                 # Clear notes that have been displayed
                 dict unset notificationsToPrint $name
+            }
+        }
+
+        if {[llength $systemNotifications] > 0} {
+            ui_notice "--->  Note:"
+            while {[llength $systemNotifications] > 0} {
+                set systemNotifications [lassign $systemNotifications note]
+                ui_notice [wrap $note 0 "    "]
+
+                if {[llength $systemNotifications] > 0} {
+                    ui_notice {}
+                    ui_notice "---"
+                    ui_notice {}
+                }
             }
         }
     }
@@ -5413,7 +5569,7 @@ if {[catch {parse_options "global" ui_options global_options} result]} {
     exit 1
 }
 
-if {[isatty stdout]
+if {[isatty stderr]
     && $portclient::progress::hasTermAnsiSend eq "yes"
     && (![info exists ui_options(ports_quiet)] || $ui_options(ports_quiet) ne "yes")} {
     set ui_options(progress_download) portclient::progress::download
@@ -5431,6 +5587,7 @@ if {[isatty stdin]
 }
 
 set ui_options(notifications_append) portclient::notifications::append
+set ui_options(notifications_system) portclient::notifications::system_append
 
 # Get arguments remaining after option processing
 set remaining_args [lrange $cmd_argv $cmd_argn end]
@@ -5439,7 +5596,11 @@ set remaining_args [lrange $cmd_argv $cmd_argn end]
 # shell mode
 if { [llength $remaining_args] == 0 && ![info exists ui_options(ports_commandfiles)] } {
     lappend ui_options(ports_commandfiles) -
-} elseif {[lookahead] eq "selfupdate" || [lookahead] eq "sync"} {
+} elseif {[lookahead] in {"selfupdate" "migrate"}} {
+    # tell mportinit not to tell the user they should selfupdate and skip the migration check
+    set ui_options(ports_no_old_index_warning) 1
+    set global_options(ports_no_migration_check) 1
+} elseif {[lookahead] eq "sync"} {
     # tell mportinit not to tell the user they should selfupdate
     set ui_options(ports_no_old_index_warning) 1
 }
@@ -5450,6 +5611,20 @@ if { [llength $remaining_args] == 0 && ![info exists ui_options(ports_commandfil
 if {[catch {mportinit ui_options global_options global_variations} result]} {
     puts $::errorInfo
     fatal "Failed to initialize MacPorts, $result"
+}
+
+# Re-execute if running under Rosetta 2 and not building for x86_64.
+# We know we are a universal binary if this is needed since mportinit
+# would have errored if not.
+if {${macports::os_major} >= 20 && ${macports::os_platform} eq "darwin" &&
+    ${macports::build_arch} ne "x86_64" &&
+    ![info exists global_options(ports_no_migration_check)] &&
+    ![catch {sysctl sysctl.proc_translated} translated] && $translated
+} then {
+    ui_warn "MacPorts started under Rosetta 2, re-executing natively"
+    execl /usr/bin/arch [list -arm64 $::argv0 {*}$::argv]
+    ui_debug "Would have executed $::argv0 $::argv"
+    ui_warn "Failed to re-execute MacPorts... just continuing"
 }
 
 # Change to port directory if requested
@@ -5539,13 +5714,17 @@ if { ($exit_status == 0 || [macports::ui_isset ports_processall]) && [info exist
         set exit_status 1
     }
 }
-if {$exit_status == -999} {
+if {$exit_status == -1} {
     set exit_status 0
 }
-
-# Check the last time 'reclaim' was run and run it
 if {$exit_status == 0} {
+    # Check the last time 'reclaim' was run and run it
     macports::reclaim_check_and_run
+}
+# Hard exit, usually because base was updated, so we don't want to do
+# anything on the way out. Hence do this after the reclaim check.
+if {$exit_status == -999} {
+    set exit_status 0
 }
 
 # shut down macports1.0

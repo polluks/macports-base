@@ -46,20 +46,22 @@ namespace eval portbuild {
 options build.asroot \
         build.jobs \
         build.jobs_arg \
+        build.mem_per_job \
         build.target \
         use_parallel_build
 commands build
 # defaults
-set build.asroot no
+default build.asroot no
 default build.dir {${worksrcpath}}
 default build.cmd {[portbuild::build_getmaketype]}
 default build.nice {${buildnicevalue}}
 default build.jobs {[portbuild::build_getjobs]}
 default build.jobs_arg {[portbuild::build_getjobsarg]}
+default build.mem_per_job 1024
 default build.pre_args {[portbuild::build_getargs]}
-set build.target all
-set build.type default
-set use_parallel_build yes
+default build.target all
+default build.type default
+default use_parallel_build yes
 
 set_ui_prefix
 
@@ -85,7 +87,7 @@ proc portbuild::add_automatic_buildsystem_dependencies {} {
 port::register_callback portbuild::add_automatic_buildsystem_dependencies
 # and an option to turn it off if required
 options build.type.add_deps
-set build.type.add_deps yes
+default build.type.add_deps yes
 
 proc portbuild::build_getmaketype {args} {
     global build.type os.platform
@@ -157,8 +159,10 @@ proc portbuild::build_getjobs {args} {
 
         macports_try -pass_signal {
             set memsize [sysctl hw.memsize]
-            if {$jobs > $memsize / (1024 * 1024 * 1024) + 1} {
-                set jobs [expr {$memsize / (1024 * 1024 * 1024) + 1}]
+            global build.mem_per_job
+            set jobs_limit_mem [expr {int($memsize / (${build.mem_per_job} * 1024 * 1024)) + 1}]
+            if {$jobs > $jobs_limit_mem} {
+                set jobs $jobs_limit_mem
             }
         } on error {} {}
     }

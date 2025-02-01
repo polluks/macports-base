@@ -38,15 +38,16 @@ package require macports_util 1.0
 package require msgcat
 package require porttrace 1.0
 
-set targets [list]
-set target_uniqid 0
-
-set all_variants [list]
+namespace eval portutil {
+    variable targets [list]
+    variable all_variants [list]
+}
 
 ########### External High Level Procedures ###########
 
 namespace eval options {
     variable option_defaults [dict create]
+    variable defaults_const [dict create]
 }
 
 # option
@@ -439,6 +440,9 @@ proc command_exec {args} {
     if {[option configure.sdkroot] ne ""} {
         set ${varprefix}.env_array(SDKROOT) [option configure.sdkroot]
     }
+    if {[option source_date_epoch] ne ""} {
+        set ${varprefix}.env_array(SOURCE_DATE_EPOCH) [option source_date_epoch]
+    }
 
     # Debug that.
     ui_debug "Environment: [environment_array_to_string ${varprefix}.env_array]"
@@ -482,11 +486,13 @@ proc command_exec {args} {
 # and adds a variable trace. The variable traces allows for delayed
 # variable and command expansion in the variable's default value.
 proc default {option val} {
-    global options::option_defaults $option
+    global options::option_defaults options::defaults_const $option
     if {[dict exists $option_defaults $option]} {
         ui_debug "Re-registering default for $option"
         # remove the old trace
-        trace remove variable $option [list read write unset] default_check
+        set is_const [expr {[dict exists $defaults_const $option] && [dict get $defaults_const $option]}]
+        set oplist [expr {$is_const ? [list write unset] : [list read write unset]}]
+        trace remove variable $option $oplist default_check
     } elseif {[info exists $option]} {
         # If option is already set and we did not set it
         # do not reset the value
@@ -494,7 +500,13 @@ proc default {option val} {
     }
     dict set option_defaults $option $val
     set $option $val
-    trace add variable $option [list read write unset] default_check
+    # Not completely accurate, but should match all simple constants,
+    # and unnecessarily setting the trace on complicated ones with
+    # backslashes, braces etc still gives correct results.
+    set is_const [expr {[string first {$} $val] == -1 && [string first {[} $val] == -1}]
+    dict set defaults_const $option $is_const
+    set oplist [expr {$is_const ? [list write unset] : [list read write unset]}]
+    trace add variable $option $oplist default_check
 }
 
 # default_check
@@ -504,18 +516,17 @@ proc default_check {varName index op} {
     set optionName [namespace tail $varName]
     global options::option_defaults $optionName
     switch $op {
-        write {
-            dict unset option_defaults $optionName
-            trace remove variable $optionName [list read write unset] default_check
-            return
-        }
         read {
             uplevel #0 [list set $optionName [uplevel #0 [list subst [dict get $option_defaults $optionName]]]]
             return
         }
-        unset {
+        unset -
+        write {
+            global options::defaults_const
+            set is_const [expr {[dict exists $defaults_const $optionName] && [dict get $defaults_const $optionName]}]
+            set oplist [expr {$is_const ? [list write unset] : [list read write unset]}]
             dict unset option_defaults $optionName
-            trace remove variable $optionName [list read write unset] default_check
+            trace remove variable $optionName $oplist default_check
             return
         }
     }
@@ -656,7 +667,7 @@ proc variant {args} {
     }
 
     # Finally append the ditem to the dlist.
-    global all_variants
+    global portutil::all_variants
     lappend all_variants $ditem
 }
 
@@ -680,7 +691,7 @@ proc variant_set {name} {
 # variant_remove_ditem name
 # Remove variant name's ditem from the all_variants dlist
 proc variant_remove_ditem {name} {
-    global all_variants
+    global portutil::all_variants
     set item_index 0
     foreach variant_item $all_variants {
         set item_provides [ditem_key $variant_item provides]
@@ -1648,7 +1659,7 @@ proc recursive_collect_deps {portname {depsfound {}}} \
 
 
 proc eval_targets {target} {
-    global targets subport version revision portvariants
+    global portutil::targets subport version revision portvariants
     set dlist $targets
 
     # the statefile will likely be autocleaned away after install,
@@ -1725,10 +1736,16 @@ proc open_statefile {args} {
     if {![tbool ports_dryrun]} {
         set need_chown 0
         if {![file isdirectory $workpath/.home]} {
+            if {[getuid] == 0 && [geteuid] != 0} {
+                elevateToRoot create_workpath
+            }
             file mkdir $workpath/.home
             set need_chown 1
         }
         if {![file isdirectory $workpath/.tmp]} {
+            if {[getuid] == 0 && [geteuid] != 0} {
+                elevateToRoot create_workpath
+            }
             file mkdir $workpath/.tmp
             set need_chown 1
         }
@@ -2026,7 +2043,7 @@ proc canonicalize_variants {variants {sign "+"}} {
 }
 
 proc eval_variants {variations} {
-    global PortInfo all_variants subport
+    global PortInfo portutil::all_variants subport
     set dlist $all_variants
     upvar $variations upvariations
     lassign [choose_variants $dlist upvariations] chosen negated
@@ -2113,7 +2130,7 @@ proc eval_variants {variations} {
 }
 
 proc check_variants {target} {
-    global targets ports_force ports_dryrun PortInfo
+    global portutil::targets ports_force ports_dryrun PortInfo
     set result 0
     set variations $PortInfo(active_variants)
 
@@ -2189,7 +2206,7 @@ proc universal_setup {args} {
 
 # constructor for target object
 proc target_new {name procedure} {
-    global targets
+    global portutil::targets
     set ditem [ditem_create]
 
     ditem_key $ditem name $name
@@ -2767,8 +2784,8 @@ proc archiveTypeIsSupported {type} {
     return -code error [format [msgcat::mc "Unsupported port archive type '%s': %s"] $type $errmsg]
 }
 
-# return the specified piece of metadata from the +CONTENTS file in the given archive
-proc extract_archive_metadata {archive_location archive_type metadata_type} {
+# return the specified pieces of metadata from the +CONTENTS file in the given archive
+proc extract_archive_metadata {archive_location archive_type metadata_types} {
     set qflag ${portutil::autoconf::tar_q}
     set raw_contents ""
 
@@ -2790,7 +2807,19 @@ proc extract_archive_metadata {archive_location archive_type metadata_type} {
     switch -- $archive_type {
         tbz -
         tbz2 {
-            set raw_contents [exec -ignorestderr [findBinary tar ${portutil::autoconf::tar_path}] -xOj${qflag}f $archive_location ./+CONTENTS]
+            global os.major os.platform
+            if {${os.major} == 8 && ${os.platform} eq "darwin"} {
+                # https://trac.macports.org/ticket/70622
+                set tar_cmd [string cat [findBinary tar ${portutil::autoconf::tar_path}] \
+                     " -xOj${qflag}f [shellescape $archive_location] ./+CONTENTS" \
+                     " 2>/dev/null || true"]
+                set raw_contents [exec -ignorestderr /bin/sh -c $tar_cmd]
+                if {$raw_contents eq ""} {
+                    error "extracting +CONTENTS from $archive_location failed"
+                }
+            } else {
+                set raw_contents [exec -ignorestderr [findBinary tar ${portutil::autoconf::tar_path}] -xOj${qflag}f $archive_location ./+CONTENTS]
+            }
         }
         tgz {
             set raw_contents [exec -ignorestderr [findBinary tar ${portutil::autoconf::tar_path}] -xOz${qflag}f $archive_location ./+CONTENTS]
@@ -2826,52 +2855,63 @@ proc extract_archive_metadata {archive_location archive_type metadata_type} {
         close $fd
         file delete -force $tempdir
     }
-    if {$metadata_type eq "contents"} {
-        set contents [list]
-        set binary_info [list]
-        set ignore 0
-        set sep [file separator]
-        foreach line [split $raw_contents \n] {
-            if {$ignore} {
+    set ret [dict create]
+    foreach metadata_type $metadata_types {
+        switch -- $metadata_type {
+            contents {
+                set contents [list]
+                set binary_info [list]
                 set ignore 0
-                continue
-            }
-            if {[string index $line 0] ne "@"} {
-                lappend contents "${sep}${line}"
-            } elseif {$line eq "@ignore"} {
-                set ignore 1
-            } elseif {[string range $line 0 15] eq "@comment binary:"} {
-                lappend binary_info [lindex $contents end] [string range $line 16 end]
-            }
-        }
-        return [list $contents $binary_info]
-    } elseif {$metadata_type eq "portname"} {
-        foreach line [split $raw_contents \n] {
-            if {[lindex $line 0] eq "@portname"} {
-                return [lindex $line 1]
-            }
-        }
-        return ""
-    } elseif {$metadata_type eq "cxx_info"} {
-        set val_cxx_stdlib ""
-        set val_cxx_stdlib_overridden ""
-        foreach line [split $raw_contents \n] {
-            if {[lindex $line 0] eq "@cxx_stdlib"} {
-                set val_cxx_stdlib [lindex $line 1]
-                if {$val_cxx_stdlib_overridden ne ""} {
-                    break
+                set sep [file separator]
+                foreach line [split $raw_contents \n] {
+                    if {$ignore} {
+                        set ignore 0
+                        continue
+                    }
+                    if {[string index $line 0] ne "@"} {
+                        lappend contents "${sep}${line}"
+                    } elseif {$line eq "@ignore"} {
+                        set ignore 1
+                    } elseif {[string range $line 0 15] eq "@comment binary:"} {
+                        lappend binary_info [lindex $contents end] [string range $line 16 end]
+                    }
                 }
-            } elseif {[lindex $line 0] eq "@cxx_stdlib_overridden"} {
-                set val_cxx_stdlib_overridden [lindex $line 1]
-                if {$val_cxx_stdlib ne ""} {
-                    break
+                dict set ret contents [list $contents $binary_info]
+            }
+            portname {
+                set portname {}
+                foreach line [split $raw_contents \n] {
+                    if {[lindex $line 0] eq "@portname"} {
+                        set portname [lindex $line 1]
+                        break
+                    }
                 }
+                dict set ret portname $portname
+            }
+            cxx_info {
+                set val_cxx_stdlib ""
+                set val_cxx_stdlib_overridden ""
+                foreach line [split $raw_contents \n] {
+                    if {[lindex $line 0] eq "@cxx_stdlib"} {
+                        set val_cxx_stdlib [lindex $line 1]
+                        if {$val_cxx_stdlib_overridden ne ""} {
+                            break
+                        }
+                    } elseif {[lindex $line 0] eq "@cxx_stdlib_overridden"} {
+                        set val_cxx_stdlib_overridden [lindex $line 1]
+                        if {$val_cxx_stdlib ne ""} {
+                            break
+                        }
+                    }
+                }
+                dict set ret cxx_info [list $val_cxx_stdlib $val_cxx_stdlib_overridden]
+            }
+            default {
+                return -code error "unknown metadata_type: $metadata_type"
             }
         }
-        return [list $val_cxx_stdlib $val_cxx_stdlib_overridden]
-    } else {
-        return -code error "unknown metadata_type: $metadata_type"
     }
+    return $ret
 }
 
 #
@@ -3175,48 +3215,40 @@ proc _libtest {depspec {return_match 0}} {
     if {$i < 0} {set i [string length $depline]}
     set depname [string range $depline 0 $i-1]
     set depversion [string range $depline $i end]
-    regsub {\.} $depversion {\.} depversion
     if {${os.platform} eq "darwin"} {
-        set depregex \^${depname}${depversion}\\.dylib\$
+        set depfilename ${depname}${depversion}.dylib
     } else {
-        set depregex \^${depname}\\.so${depversion}\$
+        set depfilename ${depname}.so${depversion}
     }
 
-    return [_mportsearchpath $depregex $search_path 0 $return_match]
+    return [_mportsearchpath $depfilename $search_path 0 $return_match]
 }
 
 ### _bintest is private; subject to change without notice
 
 proc _bintest {depspec {return_match 0}} {
     global env
-    set depregex [lindex [split $depspec :] 1]
+    set depfilename [lindex [split $depspec :] 1]
 
     set search_path [split $env(PATH) :]
 
-    set depregex \^$depregex\$
-
-    return [_mportsearchpath $depregex $search_path 1 $return_match]
+    return [_mportsearchpath $depfilename $search_path 1 $return_match]
 }
 
 ### _pathtest is private; subject to change without notice
 
 proc _pathtest {depspec {return_match 0}} {
     global prefix
-    set depregex [lindex [split $depspec :] 1]
+    set dep_path [lindex [split $depspec :] 1]
 
-    # separate directory from regex
-    set fullname $depregex
+    # Prepend prefix if not an absolute path
+    set dep_path [file join $prefix $dep_path]
 
-    regexp {^(.*)/(.*?)$} "$fullname" match search_path depregex
+    # separate directory from filename
+    set search_path [list [file dirname $dep_path]]
+    set depfilename [file tail $dep_path]
 
-    if {[string index $search_path 0] ne "/"} {
-        # Prepend prefix if not an absolute path
-        set search_path "${prefix}/${search_path}"
-    }
-
-    set depregex \^$depregex\$
-
-    return [_mportsearchpath $depregex $search_path 0 $return_match]
+    return [_mportsearchpath $depfilename $search_path 0 $return_match]
 }
 
 # returns the name of the port that will actually be satisfying $depspec
@@ -3307,93 +3339,7 @@ proc _check_xcode_version {} {
            xcodecltversion use_xcode xcode_license_unaccepted subport
 
     if {${os.subplatform} eq "macosx"} {
-        switch $macos_version_major {
-            10.4 {
-                set min 2.0
-                set ok 2.4.1
-                set rec 2.5
-            }
-            10.5 {
-                set min 3.0
-                set ok 3.1
-                set rec 3.1.4
-            }
-            10.6 {
-                set min 3.2
-                set ok 3.2
-                set rec 3.2.6
-            }
-            10.7 {
-                set min 4.1
-                set ok 4.1
-                set rec 4.6.3
-            }
-            10.8 {
-                set min 4.4
-                set ok 4.4
-                set rec 5.1.1
-            }
-            10.9 {
-                set min 5.0.1
-                set ok 5.0.1
-                set rec 6.2
-            }
-            10.10 {
-                set min 6.1
-                set ok 6.1
-                set rec 7.2.1
-            }
-            10.11 {
-                set min 7.0
-                set ok 7.0
-                set rec 8.2.1
-            }
-            10.12 {
-                set min 8.0
-                set ok 8.0
-                set rec 9.2
-            }
-            10.13 {
-                set min 9.0
-                set ok 9.0
-                set rec 9.4.1
-            }
-            10.14 {
-                set min 10.0
-                set ok 10.0
-                set rec 10.3
-            }
-            10.15 {
-                set min 11.0
-                set ok 11.3
-                set rec 11.7
-            }
-            11 {
-                set min 12.2
-                set ok 12.2
-                set rec 12.5
-            }
-            12 {
-                set min 13.1
-                set ok 13.1
-                set rec 13.4.1
-            }
-            13 {
-                set min 14.1
-                set ok 14.1
-                set rec 14.3.1
-            }
-            14 {
-                set min 15.0
-                set ok 15.1
-                set rec 15.1
-            }
-            default {
-                set min 15.0
-                set ok 15.1
-                set rec 15.1
-            }
-        }
+        lassign [get_compatible_xcode_versions] min ok rec
         if {$xcodeversion eq "none"} {
             if {[file exists "/Applications/Install Xcode.app"]} {
                 ui_warn "You downloaded Xcode from the Mac App Store but didn't install it. Run \"Install Xcode\" in the /Applications folder."

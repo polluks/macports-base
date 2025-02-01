@@ -4,8 +4,14 @@
    files before executing */
 #undef DARWINTRACE_SIP_WORKAROUND_PATH
 
+/* Define to 1 if you have the 'arc4random_buf' function. */
+#undef HAVE_ARC4RANDOM_BUF
+
 /* Define to 1 if you have the 'clearenv' function. */
 #undef HAVE_CLEARENV
+
+/* Define to 1 if you have the 'clonefile' function. */
+#undef HAVE_CLONEFILE
 
 /* Define if CommonCrypto is available. */
 #undef HAVE_COMMONCRYPTO_COMMONDIGEST_H
@@ -19,6 +25,10 @@
 /* Define to 1 if you have the declaration of
    'atomic_compare_exchange_strong_explicit', and to 0 if you don't. */
 #undef HAVE_DECL_ATOMIC_COMPARE_EXCHANGE_STRONG_EXPLICIT
+
+/* Define to 1 if you have the declaration of 'CLONE_NOOWNERCOPY', and to 0 if
+   you don't. */
+#undef HAVE_DECL_CLONE_NOOWNERCOPY
 
 /* Define to 1 if you have the declaration of 'completion_matches', and to 0
    if you don't. */
@@ -39,6 +49,10 @@
 /* Define to 1 if you have the declaration of
    'rl_username_completion_function', and to 0 if you don't. */
 #undef HAVE_DECL_RL_USERNAME_COMPLETION_FUNCTION
+
+/* Define to 1 if you have the declaration of 'RPP_STDIN', and to 0 if you
+   don't. */
+#undef HAVE_DECL_RPP_STDIN
 
 /* Define to 1 if you have the declaration of 'SHA1_File', and to 0 if you
    don't. */
@@ -75,6 +89,9 @@
 
 /* Define to 1 if you have the 'getdelim' function. */
 #undef HAVE_GETDELIM
+
+/* Define to 1 if you have the 'getentropy' function. */
+#undef HAVE_GETENTROPY
 
 /* Define to 1 if you have the 'getline' function. */
 #undef HAVE_GETLINE
@@ -142,6 +159,9 @@
 /* Define to 1 if you have the <readline/readline.h> header file. */
 #undef HAVE_READLINE_READLINE_H
 
+/* Define to 1 if you have the <readpassphrase.h> header file. */
+#undef HAVE_READPASSPHRASE_H
+
 /* Define to 1 if you have the <ripemd.h> header file. */
 #undef HAVE_RIPEMD_H
 
@@ -187,8 +207,14 @@
 /* Define to 1 if you have the 'sysctlbyname' function. */
 #undef HAVE_SYSCTLBYNAME
 
+/* Define to 1 if you have the <sys/attr.h> header file. */
+#undef HAVE_SYS_ATTR_H
+
 /* Define to 1 if you have the <sys/cdefs.h> header file. */
 #undef HAVE_SYS_CDEFS_H
+
+/* Define to 1 if you have the <sys/clonefile.h> header file. */
+#undef HAVE_SYS_CLONEFILE_H
 
 /* Define to 1 if you have the <sys/event.h> header file. */
 #undef HAVE_SYS_EVENT_H
@@ -213,6 +239,9 @@
 
 /* Define to 1 if you have the <sys/types.h> header file. */
 #undef HAVE_SYS_TYPES_H
+
+/* Define to 1 if you have the 'timingsafe_bcmp' function. */
+#undef HAVE_TIMINGSAFE_BCMP
 
 /* Platform supports tracemode. */
 #undef HAVE_TRACEMODE_SUPPORT
