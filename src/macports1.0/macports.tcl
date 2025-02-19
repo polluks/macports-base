@@ -2456,20 +2456,10 @@ proc mportopen_installed {name version revision variants options} {
     set regref [lindex [registry::entry imaged $name $version $revision $variants] 0]
     set portfile_dir [file join ${registry.path} registry portfiles ${name}-${version}_${revision} [$regref portfile]]
 
-    set variations [dict create]
-    # Relies on all negated variants being at the end of requested_variants
-    set minusvariant [lrange [split [$regref requested_variants] -] 1 end]
-    set plusvariant [lrange [split [$regref variants] +] 1 end]
-    foreach v $plusvariant {
-        dict set variations $v +
-    }
-    foreach v $minusvariant {
-        if {[string first "+" $v] == -1} {
-            dict set variations $v -
-        } else {
-            ui_warn "Invalid negated variant for $name @${version}_${revision}${variants}: $v"
-        }
-    }
+    set negative_variations [dict filter \
+        [macports::_variants_to_variations [$regref requested_variants]] \
+        value -]
+    set variations [dict merge $negative_variations [macports::_variants_to_variations [$regref variants]]]
 
     dict set options subport $name
 
@@ -2924,6 +2914,7 @@ proc macports::_upgrade_mport_deps {mport target} {
     set workername [ditem_key $mport workername]
     set deptypes [macports::_deptypes_for_target $target $workername]
     set portinfo [mportinfo $mport]
+    set opened_mports [list]
     array set depscache {}
 
     set required_archs [$workername eval [list get_canonical_archs]]
@@ -2932,15 +2923,14 @@ proc macports::_upgrade_mport_deps {mport target} {
     # Pluralize "arch" appropriately.
     set s [expr {[llength $required_archs] == 1 ? "" : "s"}]
 
-    set test _portnameactive
-
+    try {
     foreach deptype $deptypes {
         if {![dict exists $portinfo $deptype]} {
             continue
         }
         foreach depspec [dict get $portinfo $deptype] {
             set dep_portname [$workername eval [list _get_dep_port $depspec]]
-            if {$dep_portname ne "" && ![info exists depscache(port:$dep_portname)] && [$test $dep_portname]} {
+            if {$dep_portname ne "" && ![info exists depscache(port:$dep_portname)] && [_portnameactive $dep_portname]} {
                 set variants [dict create]
 
                 # check that the dep has the required archs
@@ -2960,6 +2950,14 @@ proc macports::_upgrade_mport_deps {mport target} {
                         }
                     }
                     if {[llength $missing] > 0} {
+                        # open the mport since the static index doesn't necessarily reflect the currently available variants
+                        set dep_regref [lindex [registry::entry installed $dep_portname] 0]
+                        set dep_variations [_variants_to_variations [$dep_regref requested_variants]]
+                        # open with +universal since we'll want that if we end up upgrading
+                        dict set dep_variations universal +
+                        set dep_mport [mportopen [dict get $dep_portinfo porturl] $options $dep_variations]
+                        lappend opened_mports $dep_mport
+                        set dep_portinfo [mportinfo $dep_mport]
                         if {[dict exists $dep_portinfo variants] && "universal" in [dict get $dep_portinfo variants]} {
                             # dep offers a universal variant
                             if {[llength $active_archs] == 1} {
@@ -3002,6 +3000,11 @@ proc macports::_upgrade_mport_deps {mport target} {
                     return -code error "upgrade $dep_portname failed"
                 }
             }
+        }
+    }
+    } finally {
+        foreach mport $opened_mports {
+            mportclose $mport
         }
     }
 }
@@ -3217,10 +3220,52 @@ proc macports::UpdateVCS {cmd dir} {
     return -options $options $result
 }
 
+proc macports::run_unprivileged {code {user {}}} {
+    if {[geteuid] == 0} {
+        if {$user eq {}} {
+            variable macportsuser
+            set uname $macportsuser
+            set gname {}
+        } else {
+            lassign $user uname gname
+        }
+        set uid [name_to_uid $uname]
+        if {$gname ne {}} {
+            set gid [name_to_gid $gname]
+        } else {
+            set gid [uname_to_gid $uname]
+        }
+        setegid $gid
+        seteuid $uid
+    }
+
+    try {
+        uplevel 1 $code
+    } finally {
+        if {[getuid] == 0} {
+            seteuid 0; setegid 0
+        }
+    }
+}
+
+proc macports::chown {path user} {
+    if {[getuid] != 0} {
+        ui_debug "Not root; skipping 'chown $path $user'"
+        return
+    }
+    lchown $path $user
+    if {[file isdirectory $path]} {
+        fs-traverse myfile [list $path] {
+            lchown $myfile $user
+        }
+    }
+}
+
 proc mportsync {{options {}}} {
     global macports::sources macports::ui_prefix \
            macports::os_platform macports::os_major \
-           macports::os_arch macports::autoconf::tar_path
+           macports::os_arch macports::autoconf::tar_path \
+           macports::macportsuser
 
     if {[dict exists $options no_reindex]} {
         upvar [dict get $options needed_portindex_var] any_needed_portindex
@@ -3306,10 +3351,11 @@ proc mportsync {{options {}}} {
                     set include_option {}
                     set srcstr $source
                 }
+                macports::chown $destdir $macportsuser
                 # Do rsync fetch
                 set rsync_commandline "$rsync_path $rsync_options $include_option $exclude_option $srcstr $destdir"
                 macports_try -pass_signal {
-                    system $rsync_commandline
+                    macports::run_unprivileged {system $rsync_commandline}
                 } on error {} {
                     ui_error "Synchronization of the local ports tree failed doing rsync"
                     incr numfailed
@@ -3325,7 +3371,7 @@ proc mportsync {{options {}}} {
                         set include_option "--include=/${filename} --include=/${filename}.rmd160"
                         set rsync_commandline "$rsync_path $rsync_options $include_option $exclude_option $srcstr $destdir"
                         macports_try -pass_signal {
-                            system $rsync_commandline
+                            macports::run_unprivileged {system $rsync_commandline}
                         } on error {} {
                             ui_error "Synchronization of the local ports tree failed doing rsync"
                             incr numfailed
@@ -3344,7 +3390,7 @@ proc mportsync {{options {}}} {
                     set verified 0
                     foreach pubkey $archivefetch_pubkeys {
                         macports_try -pass_signal {
-                            exec $openssl dgst -ripemd160 -verify $pubkey -signature $signature $tarball
+                            macports::run_unprivileged {exec $openssl dgst -ripemd160 -verify $pubkey -signature $signature $tarball}
                             set verified 1
                             ui_debug "successful verification with key $pubkey"
                             break
@@ -3369,10 +3415,11 @@ proc mportsync {{options {}}} {
                     }
                     # extract tarball and move into place
                     file mkdir ${extractdir}/tmp
+                    macports::chown ${extractdir}/tmp $macportsuser
                     set zflag [expr {[file extension $tarball] eq ".gz" ? "z" : ""}]
                     set tar_cmd "$tar -C ${extractdir}/tmp -x${zflag}f $tarball"
                     macports_try -pass_signal {
-                        system $tar_cmd
+                        macports::run_unprivileged {system $tar_cmd}
                     } on error {eMessage} {
                         ui_error "Failed to extract ports tree from tarball: $eMessage"
                         incr numfailed
@@ -3380,9 +3427,11 @@ proc mportsync {{options {}}} {
                     }
                     # save the local PortIndex data
                     if {[file isfile $indexfile]} {
+                        macports::chown $indexfile $macportsuser
                         file copy -force $indexfile ${destdir}/
                         file rename -force $indexfile ${extractdir}/tmp/ports/
                         if {[file isfile ${indexfile}.quick]} {
+                            macports::chown ${indexfile}.quick $macportsuser
                             file rename -force ${indexfile}.quick ${extractdir}/tmp/ports/
                         }
                     }
@@ -3410,7 +3459,7 @@ proc mportsync {{options {}}} {
                     set remote_indexdir "${index_source}PortIndex_${os_platform}_${os_major}_${os_arch}/"
                     set rsync_commandline "$rsync_path $rsync_options $include_option $remote_indexdir $destdir"
                     macports_try -pass_signal {
-                        system $rsync_commandline
+                        macports::run_unprivileged {system $rsync_commandline}
                         
                         set ok 1
                         set needs_portindex false
@@ -3420,7 +3469,10 @@ proc mportsync {{options {}}} {
                             # verify signature for PortIndex
                             foreach pubkey $archivefetch_pubkeys {
                                 macports_try -pass_signal {
-                                    exec $openssl dgst -ripemd160 -verify $pubkey -signature ${destdir}/PortIndex.rmd160 ${destdir}/PortIndex
+                                    macports::run_unprivileged {
+                                        exec $openssl dgst -ripemd160 -verify $pubkey \
+                                            -signature ${destdir}/PortIndex.rmd160 ${destdir}/PortIndex
+                                    }
                                     set ok 1
                                     set needs_portindex false
                                     ui_debug "successful verification with key $pubkey"
@@ -3476,6 +3528,7 @@ proc mportsync {{options {}}} {
                 }
 
                 file mkdir $destdir
+                macports::chown $destdir $macportsuser
 
                 global macports::portverbose macports::ui_options
                 set progressflag {}
@@ -3510,7 +3563,11 @@ proc mportsync {{options {}}} {
                 set striparg "--strip-components=1"
 
                 set tar [macports::findBinary tar $tar_path]
-                if {[catch {system -W ${destdir} "$tar $verboseflag $striparg $extflag -xf [macports::shellescape $tarpath]"} error]} {
+                if {[catch {
+                        macports::run_unprivileged {
+                            system -W ${destdir} "$tar $verboseflag $striparg $extflag -xf [macports::shellescape $tarpath]"
+                        }
+                } error]} {
                     ui_error "Extracting $source failed ($error)"
                     incr numfailed
                     continue
@@ -3546,7 +3603,13 @@ proc mportsync {{options {}}} {
             if {![dict exists $options no_reindex]} {
                 global macports::prefix
                 set indexdir [file dirname [macports::getindex $source]]
-                if {[catch {system "${prefix}/bin/portindex [macports::shellescape $indexdir]"}]} {
+                set owner [file attributes $indexdir -owner]
+                set group [file attributes $indexdir -group]
+                if {[catch {
+                        macports::run_unprivileged {
+                            system "${prefix}/bin/portindex [macports::shellescape $indexdir]"
+                        } [list $owner $group]
+                }]} {
                     ui_error "updating PortIndex for $source failed"
                 }
             }
@@ -4399,6 +4462,17 @@ proc macports::_deptype_needs_archcheck {deptype} {
     return [expr {$deptype in ${archcheck_dep_types}}]
 }
 
+# Given a variant string like '+foo+bar-baz', returns a dict mapping
+# each variant name to + or -, like {foo + bar + baz -}.
+proc macports::_variants_to_variations {variants} {
+    set variations [dict create]
+    set split_variants [string map {+ " + " - " - "} $variants]
+    foreach {sign varname} $split_variants {
+        dict set variations $varname $sign
+    }
+    return $variations
+}
+
 # selfupdate procedure
 proc macports::selfupdate {{options {}} {updatestatusvar {}}} {
     return [uplevel [list selfupdate::main $options $updatestatusvar]]
@@ -4635,31 +4709,12 @@ proc macports::_upgrade {portname dspec variations options {depscachename {}}} {
     # open the port, and update the portinfo.
     set porturl [dict get $portinfo porturl]
 
-    # Relies on all negated variants being at the end of requested_variants
-    set splitvariant [split $oldrequestedvariant -]
-    set minusvariant [lrange $splitvariant 1 end]
-    set splitvariant [split [lindex $splitvariant 0] +]
-    set plusvariant [lrange $splitvariant 1 end]
     ui_debug "Merging existing requested variants '${oldrequestedvariant}' into variants"
-    set oldrequestedvariations [dict create]
+    set oldrequestedvariations [_variants_to_variations $oldrequestedvariant]
     # also save the current variants for dependency calculation
     # purposes in case we don't end up upgrading this port
-    set installedvariations [dict create]
-    foreach v $plusvariant {
-        dict set oldrequestedvariations $v +
-    }
-    foreach v $minusvariant {
-        if {[string first "+" $v] == -1} {
-            dict set oldrequestedvariations $v -
-            dict set installedvariations $v -
-        } else {
-            ui_warn "Invalid negated variant for ${portname}: $v"
-        }
-    }
-    set plusvariant [lrange [split $oldvariant +] 1 end]
-    foreach v $plusvariant {
-        dict set installedvariations $v +
-    }
+    set installedvariations [dict filter $oldrequestedvariations value -]
+    set installedvariations [dict merge $installedvariations [_variants_to_variations $oldvariant]]
 
     # Now merge all the variations. Global (i.e. variants.conf) ones are
     # overridden by the previous requested variants, which are overridden
@@ -6605,11 +6660,6 @@ proc macports::get_parallel_jobs {{mem_restrict yes}} {
 proc macports::get_compatible_xcode_versions {} {
     variable macos_version_major
     switch $macos_version_major {
-        10.4 {
-            set min 2.0
-            set ok 2.4.1
-            set rec 2.5
-        }
         10.5 {
             set min 3.0
             set ok 3.1
