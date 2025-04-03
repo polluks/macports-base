@@ -164,55 +164,56 @@ proc portfetch::checksites {sitelists mirrorfile} {
         global ${listname}.mirror_subdir
         set full_list [set $listname]
         # add the specified global and user-defined mirrors
-        set sglobal ""
-        set senv ""
+        set global_sites [list]
+        set untagged_env_sites [list]
         if {[llength $extras] >= 2} {
-            set sglobal [lindex $extras 0]
-            set senv [lindex $extras 1]
-            append full_list " $sglobal"
+            lassign $extras sglobal senv
+            if {$sglobal ne ""} {
+                lappend full_list $sglobal
+                set global_sites [mirror_sites $sglobal "" "" $mirrorfile]
+            }
             if {[info exists env($senv)]} {
-                set full_list [concat $env($senv) $full_list]
+                foreach env_site $env($senv) {
+                    lappend full_list $env_site
+                    if {![regexp $tagged_url_re $env_site]} {
+                        lappend untagged_env_sites $env_site
+                    }
+                }
             }
         }
 
         set site_list [list]
         foreach site $full_list {
             if {[regexp $url_re $site match site]} {
-                set site_list [concat $site_list $site]
+                lappend site_list $site
             } else {
                 set splitlist [split $site :]
                 if {[llength $splitlist] > 3 || [llength $splitlist] <1} {
                     ui_error [format [msgcat::mc "Unable to process mirror sites for: %s, ignoring."] $site]
                 }
-                set mirrors "[lindex $splitlist 0]"
-                set subdir "[lindex $splitlist 1]"
-                set tag "[lindex $splitlist 2]"
+                lassign $splitlist mirrors subdir tag
                 if {[info exists ${listname}.mirror_subdir]} {
-                    append subdir "[set ${listname}.mirror_subdir]"
+                    append subdir [set ${listname}.mirror_subdir]
                 }
-                set site_list [concat $site_list [mirror_sites $mirrors $tag $subdir $mirrorfile]]
+                lappend site_list {*}[mirror_sites $mirrors $tag $subdir $mirrorfile]
+            }
+        }
+
+        set tags [dict create]
+        foreach site $site_list {
+            if {[regexp $tagged_url_re $site match site tag]} {
+                lappend urlmap($tag) $site
+                dict set tags $tag 1
+            } else {
+                lappend urlmap($listname) $site
             }
         }
 
         # add in the global and user-defined mirrors for each tag
-        foreach site $site_list {
-            if {[regexp $tagged_url_re $site match site tag] && ![info exists extras_added($tag)]} {
-                if {$sglobal ne ""} {
-                    set site_list [concat $site_list [mirror_sites $sglobal $tag "" $mirrorfile]]
-                }
-                if {[info exists env($senv)]} {
-                    set site_list [concat $env($senv) $site_list]
-                }
-                set extras_added($tag) yes
-            }
-        }
-
-        foreach site $site_list {
-        if {[regexp $tagged_url_re $site match site tag]} {
-                lappend urlmap($tag) $site
-            } else {
-                lappend urlmap($listname) $site
-            }
+        foreach tag [dict keys $tags] {
+            # Only add untagged sites from the environment here.
+            # Tagged ones will already be in the list.
+            lappend urlmap($tag) {*}$untagged_env_sites {*}$global_sites
         }
     }
 }
@@ -237,13 +238,6 @@ proc portfetch::sortsites {urls default_listvar} {
         if {[llength $urllist] <= 1} {
             # there is only one mirror, no need to ping or sort
             continue
-        }
-
-        # can't do the ping with dropped privileges (though it works fine if we didn't start as root)
-        if {[getuid] == 0 && [geteuid] != 0} {
-            set oldeuid [geteuid]
-            set oldegid [getegid]
-            seteuid 0; setegid 0
         }
 
         set hosts [list]
@@ -277,6 +271,13 @@ proc portfetch::sortsites {urls default_listvar} {
                 lset hosts $n [lindex $hosts [incr len -1]]
                 lset hosts $len $tmp
             }
+        }
+
+        # can't do the ping with dropped privileges (though it works fine if we didn't start as root)
+        if {[getuid] == 0 && [geteuid] != 0} {
+            set oldeuid [geteuid]
+            set oldegid [getegid]
+            seteuid 0; setegid 0
         }
 
         set pinged_hosts [list]
